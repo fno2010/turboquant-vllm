@@ -2,7 +2,7 @@
 
 TurboQuant+ KV cache compression for vLLM. Compress the KV cache 3.8x during inference — serve more concurrent conversations on the same GPU, or use longer context at the same cost.
 
-In early benchmarks on A100 80GB (Qwen3-30B, 5 multi-turn conversation scenarios), TQ+ **matched or outscored the uncompressed baseline on every scenario** while reducing KV cache memory to 26% of FP16. That's the same quality at ~4x the throughput per GPU dollar.
+In early benchmarks on A100 80GB (Qwen3-30B, 5 multi-turn conversation scenarios), TQ+ **matched or outscored the uncompressed baseline on every scenario** while reducing KV cache memory to 26% of FP16. The impact scales with how much of your VRAM is KV cache — for large models at long context, that's most of it.
 
 ```python
 from turboquant_vllm import patch_vllm_attention
