@@ -18,8 +18,6 @@ vLLM offers FP8 KV cache (2x compression). For large MoE models at production co
 
 | KV cache type | Compression | Quality impact |
 |---------------|-------------|----------------|
-| KV cache type | Compression | Quality impact |
-|---------------|-------------|----------------|
 | FP16 (default) | 1x | baseline |
 | FP8 (vLLM built-in) | 2x | negligible |
 | **TQ+ turbo4** | **3.8x** | **+0.23% PPL** |
@@ -42,13 +40,15 @@ Quality preserved or better on every scenario. Full benchmark across 15 model co
 ## Install
 
 ```bash
-pip install turboquant-vllm
+pip install turboquant-vllm@git+https://github.com/varjoranta/turboquant-vllm.git
 ```
 
 For vLLM integration:
 ```bash
-pip install turboquant-vllm[vllm]
+pip install "turboquant-vllm[vllm] @ git+https://github.com/varjoranta/turboquant-vllm.git"
 ```
+
+PyPI release coming soon.
 
 ## How it works
 
@@ -128,14 +128,16 @@ Design choices:
 
 At 32K context, 32 layers, 32 KV heads (typical large model):
 
+Assuming 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B, Llama-70B class models):
+
 | | FP16 | Turbo4 |
 |---|---|---|
-| KV cache size | 16.8 GB | 4.7 GB |
-| Read time at 2TB/s | 8.4 ms | 2.4 ms |
-| Dequant compute | 0 | 0.2 ms |
-| **Total** | **8.4 ms** | **2.6 ms** |
+| KV cache size | 17.2 GB | 4.6 GB |
+| Read time at 2TB/s (A100) | 8.6 ms | 2.3 ms |
+| Dequant overhead | 0 | ~0.2 ms |
+| **Net per decode step** | **8.6 ms** | **2.5 ms** |
 
-Net: **5.8ms saved per decode step** — 69% reduction in KV cache access time.
+71% reduction in KV cache access time. Models with fewer KV heads (GQA) have proportionally smaller caches, but the 3.8x ratio holds.
 
 ## Compatibility
 
