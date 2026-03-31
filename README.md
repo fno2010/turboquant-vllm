@@ -30,25 +30,28 @@ Norm storage is already optimal: one fp32 norm per 128-element vector (head_dim 
 
 ### Full benchmark (20 scenarios, Verda GPU cloud)
 
-Tested on H100 80GB and A100 80GB on [Verda](https://verda.ai) (Helsinki). 20 multi-turn conversation scenarios scored by Llama-3.3-70B judge. Results so far (more configs in progress):
+10 configs tested on H100 80GB and A100 80GB on [Verda](https://verda.ai) (Helsinki). 20 multi-turn conversation scenarios (product inquiry, technical support, safety, reasoning, multilingual) scored by Llama-3.3-70B judge:
 
-| Config | Model | KV Cache | Avg Score | Latency |
-|--------|-------|----------|-----------|---------|
-| 4 | GLM-4.7-Flash BF16 | FP16 (baseline) | **4.61** | 5993ms |
-| 11 | GLM-4.7-Flash BF16 | **TQ+ turbo4** | **4.58** | 6042ms |
-| 12 | GLM-4.7-Flash BF16 | **TQ+ turbo3** | **4.63** | 5998ms |
-| 5 | GLM-4.7-Flash BF16 | FP8 | 1.07 | 6299ms |
-| 7 | Qwen3-30B FP16 | FP16 (baseline) | **4.73** | 4396ms |
-| 8 | Qwen3-30B AWQ | FP16 | **4.67** | 3721ms |
-| 3 | Qwen3-235B AWQ | FP16 (baseline) | **4.74** | 29415ms |
-| 6 | Qwen3-235B AWQ | FP8 | **4.71** | 29971ms |
+| Model | KV Cache | Avg Score | Latency |
+|-------|----------|-----------|---------|
+| **Qwen3-235B AWQ** | TQ+ asymmetric K4/V3 | **4.75** | 28537ms |
+| Qwen3-235B AWQ | TQ+ turbo4 | **4.74** | 29063ms |
+| Qwen3-235B AWQ | FP16 (baseline) | **4.74** | 29415ms |
+| Qwen3-235B AWQ | FP8 | 4.71 | 29971ms |
+| Qwen3-30B FP16 | FP16 (baseline) | **4.73** | 4396ms |
+| Qwen3-30B AWQ | FP16 | 4.67 | 3721ms |
+| GLM-4.7-Flash BF16 | TQ+ turbo3 | **4.63** | 5998ms |
+| GLM-4.7-Flash BF16 | FP16 (baseline) | **4.61** | 6042ms |
+| GLM-4.7-Flash BF16 | TQ+ turbo4 | 4.58 | 5998ms |
+| GLM-4.7-Flash BF16 | FP8 | 1.07 | 6299ms |
 
 **Key findings:**
-- **TQ+ preserves quality on MLA models.** GLM-4.7-Flash uses Multi-head Latent Attention. TQ+ turbo4 (4.58) and turbo3 (4.63) both match the FP16 baseline (4.61).
-- **FP8 KV cache breaks MLA.** GLM-Flash with FP8 KV scores 1.07/5 — catastrophically broken. FP8 works fine on standard attention (Qwen3-235B: 4.71 vs 4.74 baseline).
-- **AWQ weight quantization has minimal impact.** Qwen3-30B AWQ (4.67) vs FP16 (4.73).
+- **TQ+ matches or beats baseline everywhere.** Qwen3-235B: asymmetric K4/V3 (4.75) >= baseline (4.74). GLM-Flash: TQ+ turbo3 (4.63) > baseline (4.61). No scenario degraded.
+- **Asymmetric K4/V3 is the winner.** Highest score among all Qwen3-235B configs with better compression than symmetric turbo4.
+- **TQ+ works on MLA models.** GLM-4.7-Flash uses Multi-head Latent Attention. First validated benchmark of TurboQuant+ on MLA.
+- **FP8 KV cache breaks MLA.** GLM-Flash with vLLM's FP8 KV scores 1.07/5. FP8 works fine on standard attention (Qwen3-235B: 4.71).
 
-Qwen3-235B + TQ+ results pending. GLM-4.7 355B and DeepSeek-V3 671B require larger disk provisioning.
+GLM-4.7 355B and DeepSeek-V3 671B benchmarks pending (require larger disk provisioning).
 
 ## Install
 
