@@ -56,7 +56,7 @@ PyPI release coming soon.
 
 ## How it works
 
-Based on [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., ICLR 2026) — data-oblivious vector quantization with near-optimal distortion. After a random rotation, vector coordinates follow a known Gaussian distribution, so **precomputed optimal centroids** replace learned codebooks. No calibration data needed.
+Based on [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025) — data-oblivious vector quantization with near-optimal distortion. After a random rotation, vector coordinates follow a known Gaussian distribution, so **precomputed optimal centroids** replace learned codebooks. No calibration data needed.
 
 Extended by [turboquant_plus](https://github.com/TheTom/turboquant_plus) for KV cache:
 
@@ -80,7 +80,7 @@ patch_vllm_attention(k_bits=4, v_bits=3)
 
 Then start vLLM normally. The patch intercepts `FlashAttentionImpl` — works with any model that uses standard FlashAttention (Qwen3, Llama, Mistral, etc.).
 
-**Note:** Models using Multi-head Latent Attention (MLA) — GLM-4.7, DeepSeek-V3 — are not yet supported. MLA already compresses KV into a latent representation with a different interface.
+**Note:** Models using Multi-head Latent Attention (MLA) — DeepSeek-V3, GLM-4.7-Flash — are not yet supported. MLA already compresses KV into a latent representation with a different interface. GLM-4.7 (non-Flash) uses GQA and is supported.
 
 ### Standalone compression (without vLLM)
 
@@ -148,7 +148,8 @@ Assuming 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B, Llama-70B
 | Model family | Attention type | TQ+ support |
 |-------------|---------------|-------------|
 | Qwen3, Llama, Mistral | FlashAttention (GQA/MHA) | **Yes** |
-| GLM-4.7, DeepSeek-V3 | Multi-head Latent Attention (MLA) | **Yes** (new) |
+| GLM-4.7 | FlashAttention (GQA) | **Yes** |
+| DeepSeek-V3, GLM-4.7-Flash | Multi-head Latent Attention (MLA) | **Yes** (new) |
 
 MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The patch compresses `kv_c_normed` with PolarQuant MSE-only and passes `k_pe` through uncompressed. Both `forward_mha` and `forward_mqa` paths are patched via `TritonMLAImpl`. GPU validation pending.
 
@@ -157,7 +158,7 @@ MLA models store a compressed latent vector (`kv_c_normed`) plus positional enco
 - **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
-- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., ICLR 2026. The underlying algorithm.
+- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., 2025. The underlying algorithm.
 
 ## License
 
