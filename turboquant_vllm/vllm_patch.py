@@ -222,17 +222,18 @@ def patch_vllm_attention(k_bits: int = 4, v_bits: int = 4):
     except ImportError:
         logger.warning("FlashAttentionImpl not found, skipping FlashAttention patch")
 
+    # Patch MLA at the common base class so all MLA backends
+    # (TritonMLA, FlashAttnMLA, FlashMLA, etc.) are covered.
     try:
         import inspect
-        from vllm.v1.attention.backends.mla.triton_mla import TritonMLAImpl
-        TritonMLAImpl.do_kv_cache_update = _make_mla_patched_cache_update(
-            TritonMLAImpl.do_kv_cache_update
+        from vllm.model_executor.layers.attention.mla_attention import MLACommonImpl
+        MLACommonImpl.do_kv_cache_update = _make_mla_patched_cache_update(
+            MLACommonImpl.do_kv_cache_update
         )
         for method_name in ("forward_mha", "forward_mqa"):
-            if hasattr(TritonMLAImpl, method_name):
-                fn = getattr(TritonMLAImpl, method_name)
+            if hasattr(MLACommonImpl, method_name):
+                fn = getattr(MLACommonImpl, method_name)
                 params = list(inspect.signature(fn).parameters.keys())
-                # Find the cache tensor parameter by name
                 cache_idx = next(
                     (i for i, p in enumerate(params) if "cache" in p.lower()),
                     None
@@ -240,13 +241,12 @@ def patch_vllm_attention(k_bits: int = 4, v_bits: int = 4):
                 if cache_idx is None:
                     logger.warning("Could not find cache param in %s, skipping", method_name)
                     continue
-                # Subtract 1 for 'self' since we call with *args after self
-                setattr(TritonMLAImpl, method_name, _make_mla_patched_forward(
+                setattr(MLACommonImpl, method_name, _make_mla_patched_forward(
                     fn, cache_idx - 1
                 ))
-        patched_backends.append("TritonMLA")
+        patched_backends.append("MLA")
     except ImportError:
-        logger.warning("TritonMLAImpl not found, skipping MLA patch")
+        logger.warning("MLACommonImpl not found, skipping MLA patch")
 
     if not patched_backends:
         raise ImportError("No vLLM attention backends found. Is vLLM installed?")
