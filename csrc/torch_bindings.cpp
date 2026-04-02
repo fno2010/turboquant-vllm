@@ -12,6 +12,7 @@
  */
 
 #include "turbo_quant.h"
+#include "tq_weight_dequant.h"
 #include <torch/extension.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -58,4 +59,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Dequantize from paged cache to contiguous fp16 buffer",
           py::arg("cache"), py::arg("norms"), py::arg("output"),
           py::arg("block_table"), py::arg("seq_len"));
+
+    // Weight dequantization kernels
+    m.def("weight_dequant", &tq_weight_dequant,
+          "Fused weight dequant: packed indices + norms + codebook → full matrix",
+          py::arg("packed_weight"), py::arg("norms"),
+          py::arg("signs1"), py::arg("signs2"),
+          py::arg("centroids"), py::arg("output"),
+          py::arg("group_size"), py::arg("bits"),
+          py::arg("out_dim"), py::arg("in_dim"));
+
+    m.def("weight_dequant_3d", &tq_weight_dequant_3d,
+          "Fused weight dequant for MoE expert tensors (3D)",
+          py::arg("packed_weight"), py::arg("norms"),
+          py::arg("signs1"), py::arg("signs2"),
+          py::arg("centroids"), py::arg("output"),
+          py::arg("group_size"), py::arg("bits"),
+          py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"));
 }

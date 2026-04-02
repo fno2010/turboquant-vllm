@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: MIT
+// TurboQuant fused weight dequantization kernel.
+//
+// Decompresses TQ-quantized weights (packed uint8 indices + per-group norms)
+// to full-precision output in a single kernel launch. Inverse WHT rotation
+// is performed in shared memory using the butterfly pattern.
+//
+// Supports 2-bit (4 centroids), 3-bit (8 centroids), and 4-bit (16 centroids).
+
+#pragma once
+#include <torch/extension.h>
+
+// Fused dequant: packed_weight + norms + codebook → full weight matrix.
+// Output shape: (out_dim, in_dim) in float16 or float32.
+//
+// packed_weight: (out_dim * n_groups, packed_group_bytes) uint8
+//   4-bit: packed_group_bytes = group_size / 2
+//   2-bit: packed_group_bytes = group_size / 4
+//   3-bit: packed_group_bytes = group_size (no sub-byte packing)
+//
+// norms: (out_dim, n_groups) float32
+// signs1, signs2: (group_size,) float32 -- random sign vectors for WHT
+// centroids: (n_centroids,) float32
+void tq_weight_dequant(
+    torch::Tensor packed_weight,
+    torch::Tensor norms,
+    torch::Tensor signs1,
+    torch::Tensor signs2,
+    torch::Tensor centroids,
+    torch::Tensor output,
+    int64_t group_size,
+    int64_t bits,
+    int64_t out_dim,
+    int64_t in_dim);
+
+// Batch dequant for MoE expert weights.
+// Same as above but operates on 3D tensors:
+//   packed_weight: (n_experts * out_dim * n_groups, packed_group_bytes)
+//   norms: (n_experts * out_dim, n_groups)
+//   output: (n_experts, out_dim, in_dim)
+void tq_weight_dequant_3d(
+    torch::Tensor packed_weight,
+    torch::Tensor norms,
+    torch::Tensor signs1,
+    torch::Tensor signs2,
+    torch::Tensor centroids,
+    torch::Tensor output,
+    int64_t group_size,
+    int64_t bits,
+    int64_t n_experts,
+    int64_t out_dim,
+    int64_t in_dim);

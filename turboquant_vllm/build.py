@@ -28,6 +28,7 @@ def build():
 
     sources = [
         str(CSRC_DIR / "turbo_quant.cu"),
+        str(CSRC_DIR / "tq_weight_dequant.cu"),
         str(CSRC_DIR / "torch_bindings.cpp"),
     ]
 

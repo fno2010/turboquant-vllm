@@ -22,6 +22,30 @@ from turboquant_vllm.torch_ops import PolarQuantTorch
 logger = logging.getLogger(__name__)
 
 _quantizers: dict[tuple[int, int], PolarQuantTorch] = {}
+_cuda_mod = None
+_cuda_available = None
+
+
+def _get_cuda_module():
+    """Lazy-load the CUDA weight dequant kernel."""
+    global _cuda_mod, _cuda_available
+    if _cuda_available is not None:
+        return _cuda_mod if _cuda_available else None
+    try:
+        from turboquant_vllm.build import build
+        _cuda_mod = build()
+        if hasattr(_cuda_mod, 'weight_dequant'):
+            _cuda_available = True
+            logger.info("CUDA weight dequant kernel loaded")
+            return _cuda_mod
+        else:
+            _cuda_available = False
+            logger.info("CUDA module missing weight_dequant, using PyTorch")
+            return None
+    except Exception as e:
+        _cuda_available = False
+        logger.warning("CUDA weight dequant not available: %s", e)
+        return None
 
 
 def _get_quantizer(group_size: int, bits: int, device: str) -> PolarQuantTorch:
@@ -130,17 +154,33 @@ class TurboQuantWrapper(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Unpack indices: (out_dim * n_groups, group_size)
-        indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
-        # Flatten norms back to (out_dim * n_groups,)
-        norms_flat = self.norms.reshape(-1)
+        cuda_mod = _get_cuda_module()
 
-        quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
-        w_groups = quantizer.dequantize(indices, norms_flat)  # (out_dim * n_groups, group_size)
+        if cuda_mod is not None:
+            # Fast path: CUDA fused dequant kernel
+            output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
+            w_deq = torch.empty(self.out_features, self.in_features,
+                                dtype=output_dtype, device=x.device)
 
-        # Reshape back to (out_dim, padded_in) then trim
-        w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, :self.in_features]
-        w_deq = w_deq.to(x.dtype)
+            quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+            cuda_mod.weight_dequant(
+                self.packed_weight, self.norms,
+                quantizer.signs1, quantizer.signs2,
+                quantizer.centroids,
+                w_deq,
+                self.group_size, self.bits,
+                self.out_features, self.in_features,
+            )
+        else:
+            # Fallback: PyTorch dequant
+            indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
+            norms_flat = self.norms.reshape(-1)
+
+            quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+            w_groups = quantizer.dequantize(indices, norms_flat)
+
+            w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, :self.in_features]
+            w_deq = w_deq.to(x.dtype)
 
         output = torch.matmul(x, w_deq.t())
         if self.bias is not None:
@@ -194,12 +234,30 @@ class Compressed3D:
 
     def decompress(self) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype."""
-        indices = unpack_indices(self.packed, self.bits, self.group_size)
-        norms_flat = self.norms.reshape(-1)
-        quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
-        groups = quantizer.dequantize(indices, norms_flat)
-        result = groups.reshape(-1, self.padded_in)[:, :self.in_dim]
-        return result.reshape(self.shape).to(self.dtype)
+        cuda_mod = _get_cuda_module()
+        n_experts, out_dim, in_dim = self.shape
+
+        if cuda_mod is not None:
+            output_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
+            output = torch.empty(n_experts, out_dim, in_dim,
+                                 dtype=output_dtype, device=self.packed.device)
+            quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
+            cuda_mod.weight_dequant_3d(
+                self.packed, self.norms,
+                quantizer.signs1, quantizer.signs2,
+                quantizer.centroids,
+                output,
+                self.group_size, self.bits,
+                n_experts, out_dim, in_dim,
+            )
+            return output.to(self.dtype)
+        else:
+            indices = unpack_indices(self.packed, self.bits, self.group_size)
+            norms_flat = self.norms.reshape(-1)
+            quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
+            groups = quantizer.dequantize(indices, norms_flat)
+            result = groups.reshape(-1, self.padded_in)[:, :self.in_dim]
+            return result.reshape(self.shape).to(self.dtype)
 
     @property
     def ratio(self) -> float:
