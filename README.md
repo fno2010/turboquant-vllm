@@ -207,6 +207,24 @@ Same math, same CUDA kernels. Weight compression reduces the hardware you need. 
 
 Contributions and testing on different models welcome. Write-up: [varjosoft.com/weight-compression.html](https://varjosoft.com/weight-compression.html)
 
+## Native vLLM fork
+
+For production use without monkey-patching, we maintain a vLLM fork with TurboQuant built in as a native attention backend:
+
+```bash
+# Install from fork
+pip install git+https://github.com/varjoranta/vllm-1.git@turboquant-integration
+
+# Use directly — no patching needed
+vllm serve Qwen/Qwen3-8B --kv-cache-dtype tq3
+```
+
+The fork includes a standalone `TurboQuantAttentionBackend` with Triton/CUDA kernels, FP8 value storage for quality preservation, and asymmetric K/V support (`--kv-cache-dtype tq_k4v3`). Based on [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) with quality fixes.
+
+**This library** (monkey-patch approach) remains useful for quick testing with any existing vLLM install, weight quantization, and models not yet supported by the native backend.
+
+Fork: [varjoranta/vllm-1 `turboquant-integration`](https://github.com/varjoranta/vllm-1/tree/turboquant-integration)
+
 ## Related projects
 
 - **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
