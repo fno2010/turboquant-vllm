@@ -56,6 +56,21 @@ Norm storage is already optimal: one fp32 norm per 128-element vector (head_dim 
 
 GLM-4.7 355B and DeepSeek-V3 671B benchmarks pending (require larger disk provisioning).
 
+### Tested models and known issues
+
+| Model family | Attention | KV cache TQ | Notes |
+|---|---|---|---|
+| Qwen3 (0.6B-235B) | GQA | Works | Tested extensively, including 235B AWQ |
+| Qwen3-8B | GQA | Works | Native vLLM backend confirmed on A100 |
+| GLM-4.7-Flash | MLA | Works | TQ+ handles MLA correctly (FP8 does not) |
+| DeepSeek-V3 | MLA | Works | Via MLACommonImpl patch |
+| Qwen3.5 (hybrid) | GatedDeltaNet + GQA | Untested | Hybrid architecture, may need layer-specific handling |
+| gpt-oss-20b | Alternating full/sliding window + sinks | Not yet | Returns empty output. Sliding window + attention sinks need pass-through support |
+
+Standard GQA/MHA models work. MLA models work via the monkey-patch library. Models with non-standard attention (sliding window, attention sinks, hybrid recurrent) are not yet supported in the native backend.
+
+**GPU compatibility:** Tested on A100 (SM80), RTX 6000 Ada (SM89), H100 (SM90). RTX PRO 6000 Blackwell (SM120) lacks FlashAttention-4 hardware support, which the native TQ backend currently depends on for prefill.
+
 ## Install
 
 ```bash
