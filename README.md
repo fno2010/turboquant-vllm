@@ -253,28 +253,29 @@ Fork: [varjoranta/vllm-1 `turboquant-integration`](https://github.com/varjoranta
 
 ## Serverless deployment
 
-Deploy models to [Verda](https://verda.com) GPU cloud (Helsinki) with scale-to-zero billing. Uses stock vLLM Docker image with cmd overrides — no custom Dockerfile needed.
+Deploy models to [Verda](https://verda.com) GPU cloud (Helsinki) with scale-to-zero billing.
 
 ```bash
-python containers/deploy.py deploy gpt-oss-20b       # L40S, best value for chat
-python containers/deploy.py deploy qwen3-235b-awq    # H200, best quality
-python containers/deploy.py pause gpt-oss-20b        # stop billing
+python containers/deploy.py deploy gemma4-26b-it      # A100, best quality/cost ratio
+python containers/deploy.py deploy gpt-oss-20b        # L40S, cheapest good model
+python containers/deploy.py deploy qwen3-235b-awq     # H200, highest quality
+python containers/deploy.py pause gemma4-26b-it       # stop billing
 ```
 
 ### Measured results (April 2026)
 
-| Model | Active params | GPU | Cold start | Warm start | Throughput | Per session |
+| Model | Active params | GPU | Cost/hr | Cold start | Quality | Per session |
 |---|---|---|---|---|---|---|
-| gpt-oss-20b | 3.6B (MoE) | L40S $0.90/hr | 3.3 min | 2.7 min | 42 tok in 2.4s | ~$0.15 |
-| Qwen3-8B | 8B | L40S $0.90/hr | 3 min | — | 38-51 tok/s | ~$0.15 |
-| Qwen3-1.7B | 1.7B | L40S $0.90/hr | 2 min | — | — | ~$0.15 |
-| Qwen3-235B AWQ | 22B (MoE) | H200 $3.39/hr | 5.5 min | — | 23 tok/s | ~$0.57 |
+| **Gemma 4 26B MoE** | 3.8B | A100 80GB | $1.29 | 3 min | Excellent (#6 Arena AI) | ~$0.22 |
+| gpt-oss-20b | 3.6B | L40S 48GB | $0.90 | 3.3 min | Very good | ~$0.15 |
+| Qwen3-8B | 8B | L40S 48GB | $0.90 | 3 min | Good | ~$0.15 |
+| Qwen3-235B AWQ | 22B | H200 141GB | $3.39 | 5.5 min | Best (4.75/5 benchmark) | ~$0.57 |
 
-Cold start = first boot (model download + load). Warm start = resume from paused (model cached on persistent volume).
+Cold start = time from zero replicas to first token (model cached on persistent volume). Billing per 10-minute block.
 
-**Gemma 4 26B MoE** (3.8B active, Apache 2.0, #6 on Arena AI): working on A100 80GB with `transformers>=5.5.0`. Concise, well-formatted output. Use `google/gemma-4-26B-A4B-it` (not the base model). Needs custom vLLM image with upgraded transformers — see [containers/](https://github.com/varjoranta/verda-model-bench/tree/main/containers).
+**Gemma 4 setup:** Requires custom vLLM image with `transformers>=5.5.0` and `python3-dev`. Use the instruction-tuned variant `google/gemma-4-26B-A4B-it`. Released April 2, 2026. Apache 2.0.
 
-**For real-time chat, always-warm is required** — cold starts of 2-5 minutes are too slow for interactive use. Always-warm cost: ~$216/month for gpt-oss-20b on L40S (8hr/day). Serverless scale-to-zero is practical for batch processing, internal tools, or async workloads.
+**For real-time chat, always-warm is required** — cold starts of 2-5 minutes are too slow for interactive use. Monthly cost (8hr/day): Gemma 4 on A100 ~$310, gpt-oss-20b on L40S ~$216. Serverless scale-to-zero works for batch/async workloads.
 
 Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blob/main/containers/deploy.py)
 
