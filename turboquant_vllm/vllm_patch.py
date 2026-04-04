@@ -58,6 +58,8 @@ def _get_compressor(dim: int, device: torch.device) -> KVCacheCompressorTorch:
             dim, k_bits=_k_bits, v_bits=_v_bits,
             seed=42, device=str(device),
             use_cuda=_use_cuda,
+            norm_correction=True,
+            use_qjl=False,
         )
         stats = _compressors[dim].memory_stats()
         backend = "CUDA" if _use_cuda else "PyTorch"

@@ -162,8 +162,15 @@ class PolarQuantTorch:
         padded *= self.signs1.unsqueeze(0)
         return padded[:, :self.dim]
 
-    def quantize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantize vectors. x: (batch, dim) or (dim,). Returns (indices, norms)."""
+    def quantize(self, x: torch.Tensor, norm_correction: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize vectors. x: (batch, dim) or (dim,). Returns (indices, norms).
+
+        Args:
+            norm_correction: If True, store original_norm / reconstruction_norm
+                instead of raw original_norm. This corrects the magnitude error
+                introduced by quantization, improving PPL. Based on MidasMining's
+                finding adopted in vLLM PR #38479.
+        """
         squeeze = x.dim() == 1
         if squeeze:
             x = x.unsqueeze(0)
@@ -176,12 +183,23 @@ class PolarQuantTorch:
         y = self._rotate(x_unit)
         indices = torch.searchsorted(self.boundaries, y.contiguous())
 
+        if norm_correction:
+            # Compute reconstruction norm to correct magnitude error
+            y_hat = self.centroids[indices]
+            x_hat_unit = self._rotate_inverse(y_hat)
+            recon_norm = torch.linalg.norm(x_hat_unit, dim=1)
+            safe_recon = torch.where(recon_norm > 0, recon_norm, torch.ones_like(recon_norm))
+            norms = norms / safe_recon
+
         if squeeze:
             return indices.squeeze(0), norms.squeeze(0)
         return indices, norms
 
     def dequantize(self, indices: torch.Tensor, norms: torch.Tensor) -> torch.Tensor:
-        """Dequantize. indices: (batch, dim) or (dim,). Returns reconstructed vectors."""
+        """Dequantize. indices: (batch, dim) or (dim,). Returns reconstructed vectors.
+
+        Works with both raw norms and norm-corrected norms (from quantize(norm_correction=True)).
+        """
         squeeze = indices.dim() == 1
         if squeeze:
             indices = indices.unsqueeze(0)
@@ -305,27 +323,40 @@ class KVCacheCompressorTorch:
         seed: int = 42,
         device: str = "cuda",
         use_cuda: bool = False,
+        norm_correction: bool = True,
+        use_qjl: bool = False,
     ):
+        """
+        Args:
+            norm_correction: Store original_norm/reconstruction_norm instead
+                of raw norm. Corrects magnitude error from quantization.
+                Default True (matches vLLM PR #38479 presets).
+            use_qjl: Use QJL residual correction for K cache. Default False
+                (QJL hurts quality per TheTom's turbo4-resurrection research).
+                When False, all k_bits go to PolarQuant centroids.
+        """
         self.head_dim = head_dim
         self.k_bits = k_bits
         self.v_bits = v_bits
         self.device = device
         self.use_cuda = use_cuda
+        self.norm_correction = norm_correction
+        self.use_qjl = use_qjl
         self._cuda_mod = None
 
         if use_cuda:
             self._init_cuda(head_dim, k_bits, v_bits, seed, device)
 
-        # K: PolarQuant at (k_bits - 1) + QJL at 1 bit = k_bits total
-        # Exception: k_bits=1 uses only QJL
-        if k_bits >= 2:
+        if use_qjl and k_bits >= 2:
+            # Legacy: K = PolarQuant(k_bits-1) + QJL(1 bit)
             self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed, device=device)
             self.k_qjl = QJLTorch(head_dim, seed=seed + 1000, device=device)
         else:
-            self.k_polar = None
-            self.k_qjl = QJLTorch(head_dim, seed=seed + 1000, device=device)
+            # Default: K = PolarQuant(k_bits), no QJL. All bits for centroids.
+            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed, device=device)
+            self.k_qjl = None
 
-        # V: PolarQuant MSE-only at full v_bits (no QJL)
+        # V: PolarQuant MSE-only at full v_bits
         self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500, device=device)
 
     def _init_cuda(self, head_dim, k_bits, v_bits, seed, device):
@@ -353,52 +384,42 @@ class KVCacheCompressorTorch:
 
     def compress_k(self, k: torch.Tensor) -> CompressedKV:
         """Compress key vectors. k: (num_tokens, head_dim)."""
-        if self.use_cuda and self._cuda_mod is not None:
-            # CUDA path: standalone PolarQuant quantize (uses K codebook)
+        if self.use_cuda and self._cuda_mod is not None and not self.use_qjl:
             n = k.shape[0]
             indices = torch.zeros(n, self.head_dim, dtype=torch.uint8, device=self.device)
             norms = torch.zeros(n, dtype=torch.float32, device=self.device)
             self._cuda_mod.quantize(k.half(), indices, norms)
-            # QJL still via PyTorch (CUDA QJL kernel needs the full pipeline)
-            x_hat = torch.zeros_like(k, dtype=torch.float16)
-            self._cuda_mod.dequantize(indices, norms, x_hat)
-            residual = k.float() - x_hat.float()
-            qjl_signs, qjl_norms = self.k_qjl.quantize(residual)
-            return CompressedKV(indices=indices.to(torch.int64), norms=norms, qjl_signs=qjl_signs, qjl_norms=qjl_norms)
+            # Note: CUDA path doesn't support norm_correction yet
+            return CompressedKV(indices=indices.to(torch.int64), norms=norms)
 
-        if self.k_polar is not None:
+        if self.k_qjl is not None:
+            # Legacy QJL path: PolarQuant + QJL residual correction
             indices, norms, residual = self.k_polar.quantize_and_residual(k)
             qjl_signs, qjl_norms = self.k_qjl.quantize(residual)
             return CompressedKV(indices=indices, norms=norms, qjl_signs=qjl_signs, qjl_norms=qjl_norms)
-        else:
-            signs, norms = self.k_qjl.quantize(k)
-            return CompressedKV(indices=torch.zeros_like(signs), norms=norms, qjl_signs=signs, qjl_norms=norms)
+
+        # Default: PolarQuant only, all bits for centroids
+        indices, norms = self.k_polar.quantize(k, norm_correction=self.norm_correction)
+        return CompressedKV(indices=indices, norms=norms)
 
     def compress_v(self, v: torch.Tensor) -> CompressedKV:
         """Compress value vectors. v: (num_tokens, head_dim). MSE-only, no QJL."""
-        if self.use_cuda and self._cuda_mod is not None:
-            # CUDA PolarQuant for V — need to swap to V codebook temporarily
-            # The standalone quantize/dequantize uses K codebook, so use PyTorch for V
-            # TODO: add is_key flag to standalone CUDA kernels
-            pass
-        indices, norms = self.v_polar.quantize(v)
+        indices, norms = self.v_polar.quantize(v, norm_correction=self.norm_correction)
         return CompressedKV(indices=indices, norms=norms)
 
     def decompress_k(self, compressed: CompressedKV) -> torch.Tensor:
         """Decompress key vectors to fp32."""
-        if self.use_cuda and self._cuda_mod is not None:
+        if self.use_cuda and self._cuda_mod is not None and self.k_qjl is None:
             n = compressed.indices.shape[0]
             x_hat = torch.zeros(n, self.head_dim, dtype=torch.float16, device=self.device)
             self._cuda_mod.dequantize(compressed.indices.to(torch.uint8), compressed.norms, x_hat)
-            x_qjl = self.k_qjl.dequantize(compressed.qjl_signs, compressed.qjl_norms)
-            return x_hat.float() + x_qjl
+            return x_hat.float()
 
-        if self.k_polar is not None:
-            x_mse = self.k_polar.dequantize(compressed.indices, compressed.norms)
+        x_mse = self.k_polar.dequantize(compressed.indices, compressed.norms)
+        if self.k_qjl is not None and compressed.qjl_signs is not None:
             x_qjl = self.k_qjl.dequantize(compressed.qjl_signs, compressed.qjl_norms)
             return x_mse + x_qjl
-        else:
-            return self.k_qjl.dequantize(compressed.qjl_signs, compressed.qjl_norms)
+        return x_mse
 
     def decompress_v(self, compressed: CompressedKV) -> torch.Tensor:
         """Decompress value vectors to fp32."""
@@ -406,10 +427,13 @@ class KVCacheCompressorTorch:
 
     def memory_stats(self) -> dict:
         """Storage per token per head in bytes."""
-        # K: (k_bits - 1) bits/coord for PolarQuant + 1 bit/coord for QJL
-        #    + 32 bits for PQ norm + 32 bits for QJL norm
-        k_bits_per_token = self.head_dim * self.k_bits + 64  # two norms
-        # V: v_bits bits/coord + 32 bits for norm
+        if self.use_qjl:
+            # K: (k_bits-1) PolarQuant + 1 QJL + 2 norms
+            k_bits_per_token = self.head_dim * self.k_bits + 64
+        else:
+            # K: k_bits PolarQuant + 1 norm
+            k_bits_per_token = self.head_dim * self.k_bits + 32
+        # V: v_bits PolarQuant + 1 norm
         v_bits_per_token = self.head_dim * self.v_bits + 32
         # FP16 baseline
         fp16_bits = self.head_dim * 16
