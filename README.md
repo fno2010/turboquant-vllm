@@ -251,6 +251,25 @@ The fork includes a standalone `TurboQuantAttentionBackend` with Triton/CUDA ker
 
 Fork: [varjoranta/vllm-1 `turboquant-integration`](https://github.com/varjoranta/vllm-1/tree/turboquant-integration)
 
+## Serverless deployment
+
+Deploy models to Verda GPU cloud with scale-to-zero billing:
+
+```bash
+python containers/deploy.py deploy qwen3-235b-awq   # H200, $0.57/session
+python containers/deploy.py deploy qwen3-8b          # L40S, $0.15/session
+python containers/deploy.py pause qwen3-235b-awq     # stop billing
+```
+
+Uses stock vLLM Docker image with cmd overrides. Persistent volume caches model weights across cold starts. No custom Dockerfile needed.
+
+| Model | GPU | Cold start | Throughput | Per session |
+|---|---|---|---|---|
+| Qwen3-8B | L40S | ~3 min | 38-51 tok/s | ~$0.15 |
+| Qwen3-235B AWQ | H200 | ~5.5 min | 23 tok/s | ~$0.57 |
+
+Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blob/main/containers/deploy.py)
+
 ## Related projects
 
 - **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
