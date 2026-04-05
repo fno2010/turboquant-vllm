@@ -36,6 +36,11 @@ _v_bits = 4
 _use_cuda = False
 _norm_correction = True
 _use_qjl = False
+_sink_tokens = 4  # first N positions per layer stored at FP16
+_boundary_layers = 5  # first/last N layers get higher K precision
+_total_layers = 0  # set during patching from model config
+_layer_token_counts: dict[int, int] = {}  # layer_id → tokens seen
+_layer_indices: dict[int, int] = {}  # layer_id → layer index (0-based)
 
 
 def _try_cuda_init() -> bool:
@@ -53,23 +58,49 @@ def _try_cuda_init() -> bool:
         return False
 
 
-def _get_compressor(dim: int, device: torch.device) -> KVCacheCompressorTorch:
-    """One compressor per vector dimension (all layers share the same codebook)."""
-    if dim not in _compressors:
-        _compressors[dim] = KVCacheCompressorTorch(
-            dim, k_bits=_k_bits, v_bits=_v_bits,
+def _get_compressor(dim: int, device: torch.device, layer_idx: int = -1) -> KVCacheCompressorTorch:
+    """One compressor per (dimension, precision tier).
+
+    Boundary layers (first/last N) get higher K precision if layer-adaptive
+    is enabled (_boundary_layers > 0 and _total_layers > 0).
+    """
+    is_boundary = (
+        _boundary_layers > 0
+        and _total_layers > 0
+        and layer_idx >= 0
+        and (layer_idx < _boundary_layers or layer_idx >= _total_layers - _boundary_layers)
+    )
+    # Boundary layers: K at 8-bit (FP8-equivalent precision via more centroids)
+    k = 8 if is_boundary else _k_bits
+    key = (dim, k)
+
+    if key not in _compressors:
+        _compressors[key] = KVCacheCompressorTorch(
+            dim, k_bits=k, v_bits=_v_bits,
             seed=42, device=str(device),
             use_cuda=_use_cuda,
             norm_correction=_norm_correction,
             use_qjl=_use_qjl,
         )
-        stats = _compressors[dim].memory_stats()
+        stats = _compressors[key].memory_stats()
         backend = "CUDA" if _use_cuda else "PyTorch"
         logger.info(
             "TurboQuant+ compressor [%s]: dim=%d K=%d-bit V=%d-bit → %.1fx compression",
             backend, dim, _k_bits, _v_bits, stats["compression_ratio"],
         )
     return _compressors[dim]
+
+
+def _auto_register_layer(_layer, layer_id):
+    """Assign layer index by registration order.
+
+    vLLM processes layers sequentially during the first forward pass,
+    so registration order matches layer index.
+    """
+    global _total_layers
+    idx = len(_layer_indices)
+    _layer_indices[layer_id] = idx
+    _total_layers = max(_total_layers, idx + 1)
 
 
 def _iter_slots(slot_mapping, block_size):
@@ -93,15 +124,31 @@ def _make_patched_cache_update(original_fn):
         layer_id = id(layer)
         if layer_id not in _cache:
             _cache[layer_id] = {}
+        if layer_id not in _layer_token_counts:
+            _layer_token_counts[layer_id] = 0
+        if layer_id not in _layer_indices:
+            # Auto-detect layer index from module structure
+            _auto_register_layer(layer, layer_id)
 
         head_dim = key.shape[-1]
         num_kv_heads = key.shape[1] if key.dim() == 3 else 1
-        compressor = _get_compressor(head_dim, key.device)
+
+        # Get layer index for layer-adaptive compression
+        li = _layer_indices.get(layer_id, -1)
+        compressor = _get_compressor(head_dim, key.device, layer_idx=li)
 
         key_cache, _ = kv_cache.unbind(0)
         block_size = key_cache.shape[1]
 
         for t, block_idx, offset in _iter_slots(slot_mapping, block_size):
+            pos = _layer_token_counts[layer_id]
+            _layer_token_counts[layer_id] += 1
+
+            if pos < _sink_tokens:
+                # Sink positions: store as None to signal FP16 passthrough
+                _cache[layer_id][(block_idx, offset, 0)] = None
+                continue
+
             for h in range(num_kv_heads):
                 ck = compressor.compress_k(key[t, h].unsqueeze(0))
                 cv = compressor.compress_v(value[t, h].unsqueeze(0))
@@ -122,10 +169,15 @@ def _make_patched_forward(original_fn):
         if not store:
             return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output)
 
-        compressor = _get_compressor(query.shape[-1], query.device)
+        li = _layer_indices.get(id(layer), -1)
+        compressor = _get_compressor(query.shape[-1], query.device, layer_idx=li)
         key_cache, value_cache = kv_cache.unbind(0)
 
-        for (block_idx, offset, head_idx), (ck, cv) in store.items():
+        for (block_idx, offset, head_idx), compressed in store.items():
+            if compressed is None:
+                # Sink position: already stored as FP16, no decompression needed
+                continue
+            ck, cv = compressed
             key_cache[block_idx, offset, head_idx] = compressor.decompress_k(ck).squeeze(0).to(key_cache.dtype)
             value_cache[block_idx, offset, head_idx] = compressor.decompress_v(cv).squeeze(0).to(value_cache.dtype)
 
@@ -205,6 +257,8 @@ def patch_vllm_attention(
     v_bits: int = 4,
     norm_correction: bool = True,
     use_qjl: bool = False,
+    sink_tokens: int = 4,
+    boundary_layers: int = 5,
 ):
     """Monkey-patch vLLM attention backends for TurboQuant+ KV cache.
 
@@ -216,12 +270,20 @@ def patch_vllm_attention(
         v_bits: Bits for value compression (default 4).
         norm_correction: Correct reconstruction magnitude error (default True).
         use_qjl: Use QJL residual correction for K cache (default False).
+        sink_tokens: First N positions per layer stored at FP16 (default 4).
+            Attention sinks get universal attention and need full precision.
+            Set to 0 to disable.
+        boundary_layers: First and last N layers get K=8-bit precision (default 5).
+            Boundary layers carry more signal through the residual stream.
+            Set to 0 to disable.
     """
-    global _k_bits, _v_bits, _norm_correction, _use_qjl
+    global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers
     _k_bits = k_bits
     _v_bits = v_bits
     _norm_correction = norm_correction
     _use_qjl = use_qjl
+    _sink_tokens = sink_tokens
+    _boundary_layers = boundary_layers
 
     _try_cuda_init()
 
