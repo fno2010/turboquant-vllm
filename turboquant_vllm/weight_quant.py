@@ -371,32 +371,11 @@ class Compressed3D:
     def decompress(self, buf: torch.Tensor | None = None) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype.
 
-        Args:
-            buf: Optional pre-allocated output buffer to avoid repeated allocation.
-                 Must match shape and be on the same device. Dtype can differ
-                 (will be used as-is for CUDA path, cast for PyTorch path).
+        Uses chunked decompression (8 experts at a time) to limit GPU memory.
         """
-        cuda_mod = _get_cuda_module()
         n_experts, out_dim, in_dim = self.shape
 
-        if cuda_mod is not None:
-            output_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
-            if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == output_dtype:
-                output = buf
-            else:
-                output = torch.empty(n_experts, out_dim, in_dim,
-                                     dtype=output_dtype, device=self.packed.device)
-            quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
-            cuda_mod.weight_dequant_3d(
-                self.packed, self.norms,
-                quantizer.signs1, quantizer.signs2,
-                quantizer.centroids,
-                output,
-                self.group_size, self.bits,
-                n_experts, out_dim, in_dim,
-            )
-            return output.to(self.dtype)
-        else:
+        if True:  # Always use chunked PyTorch path for correctness and memory efficiency
             # Chunked decompression to limit peak GPU memory.
             # Process a few experts at a time instead of all at once,
             # so FP32 temporaries stay small (~0.5 GB per chunk vs ~8 GB all at once).
