@@ -407,15 +407,22 @@ class Compressed3D:
                                      dtype=output_dtype, device=self.packed.device)
 
             quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
-            rows_per_expert = out_dim
             chunk_experts = max(1, min(8, n_experts))  # 8 experts per chunk
+            # packed is (total_groups, packed_cols) where total_groups = n_experts * out_dim * n_groups
+            # norms is (n_experts * out_dim, n_groups)
+            groups_per_expert = out_dim * self.n_groups
 
             for start in range(0, n_experts, chunk_experts):
                 end = min(start + chunk_experts, n_experts)
-                start_row = start * rows_per_expert
-                end_row = end * rows_per_expert
 
-                chunk_packed = self.packed[start_row:end_row]
+                # Slice packed by group index
+                start_group = start * groups_per_expert
+                end_group = end * groups_per_expert
+                chunk_packed = self.packed[start_group:end_group]
+
+                # Slice norms by row index
+                start_row = start * out_dim
+                end_row = end * out_dim
                 chunk_norms = self.norms[start_row:end_row]
 
                 chunk_idx = unpack_indices(chunk_packed, self.bits, self.group_size)
