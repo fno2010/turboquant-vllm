@@ -773,9 +773,16 @@ def enable_weight_quantization(bits: int = 3, group_size: int = 128,
         routed_expert_bits: Override bit width for routed expert weights.
             Set to 2 for aggressive compression (viable for routed experts).
     """
+    import os
     assert 2 <= bits <= 8, f"bits must be 2-8, got {bits}"
     assert group_size in (64, 128, 256), f"group_size must be 64/128/256, got {group_size}"
     assert 0.0 <= prune_experts < 1.0, f"prune_experts must be 0.0-1.0, got {prune_experts}"
+
+    # Set env vars so the vLLM plugin can re-apply in spawned subprocesses (V1 engine).
+    # The plugin (turboquant_vllm._vllm_plugin) is loaded by vLLM's plugin system
+    # in every process and checks these vars.
+    os.environ["TQ_WEIGHT_BITS"] = str(bits)
+    os.environ["TQ_WEIGHT_GROUP_SIZE"] = str(group_size)
 
     try:
         from vllm.model_executor.model_loader.utils import process_weights_after_loading as _original_process

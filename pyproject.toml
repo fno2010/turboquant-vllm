@@ -24,6 +24,9 @@ classifiers = [
 vllm = ["vllm>=0.6"]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 
+[project.entry-points."vllm.general_plugins"]
+turboquant_weight = "turboquant_vllm._vllm_plugin:register"
+
 [project.urls]
 Homepage = "https://github.com/varjoranta/turboquant-vllm"
 
