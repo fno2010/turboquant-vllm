@@ -421,8 +421,18 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         modules_to_hook[mod_id][1].append(param_name)
         expert_count += 1
 
+    # Disable buffer pooling on memory-constrained GPUs to avoid
+    # keeping ~40 GB of decompression buffers across all MoE layers.
+    gpu_mem_gb = 0
+    if device != "cpu" and torch.cuda.is_available():
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    pool = gpu_mem_gb > 60  # Only pool on GPUs with >60 GB (A100, H100, etc.)
+
     for mod_id, (owner, param_names) in modules_to_hook.items():
-        _register_moe_hooks(owner, param_names)
+        _register_moe_hooks(owner, param_names, pool_buffers=pool)
+
+    if not pool:
+        logger.info("Buffer pooling disabled (GPU %.0f GB < 60 GB)", gpu_mem_gb)
 
     # Step 5: Load remaining non-compressed tensors (embeddings, norms, biases)
     # These are tensors NOT associated with any packed weight

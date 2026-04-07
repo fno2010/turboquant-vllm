@@ -294,6 +294,7 @@ class TurboQuantWrapper(nn.Module):
         if w_deq.dtype != x.dtype:
             w_deq = w_deq.to(x.dtype)
         output = torch.matmul(x, w_deq.t())
+        del w_deq  # free decompressed weight immediately
         if self.bias is not None:
             output = output + self.bias
         return output
@@ -462,16 +463,16 @@ def _compress_3d_param(module: nn.Module, param_name: str, bits: int, group_size
     return compressed.original_bytes, compressed.compressed_bytes
 
 
-def _register_moe_hooks(module: nn.Module, param_names: list[str]):
+def _register_moe_hooks(module: nn.Module, param_names: list[str],
+                        pool_buffers: bool = True):
     """Register pre/post forward hooks that decompress expert weights on demand.
 
-    Uses per-parameter buffer pooling: a decompression buffer is allocated once
-    and reused across forward passes, eliminating the allocation/deallocation
-    overhead that was the main bottleneck (96 expert tensors × 48 layers per token).
-
-    Buffer attributes are stored as _tq_buf_{param_name} on the module.
+    Args:
+        pool_buffers: If True, keep decompression buffers allocated between
+            forward passes for reuse (faster, uses more memory). If False,
+            free buffers after each forward (slower, saves ~40 GB for large MoE).
+            Use False on memory-constrained GPUs (e.g., L40S 48GB).
     """
-    # Pre-compute attribute names to avoid f-string formatting on hot path
     comp_names = [f"_tq_{pname}" for pname in param_names]
     buf_names = [f"_tq_buf_{pname}" for pname in param_names]
 
@@ -480,19 +481,21 @@ def _register_moe_hooks(module: nn.Module, param_names: list[str]):
             compressed = getattr(mod, comp_name, None)
             if compressed is None:
                 continue
-            buf = getattr(mod, buf_name, None)
+            buf = getattr(mod, buf_name, None) if pool_buffers else None
             decompressed = compressed.decompress(buf=buf)
-            if buf is None or buf.data_ptr() != decompressed.data_ptr():
+            if pool_buffers and (buf is None or buf.data_ptr() != decompressed.data_ptr()):
                 setattr(mod, buf_name, decompressed)
             getattr(mod, pname).data = decompressed
 
     def post_hook(mod, args, output):
-        for pname, comp_name in zip(param_names, comp_names):
+        for pname, comp_name, buf_name in zip(param_names, comp_names, buf_names):
             compressed = getattr(mod, comp_name, None)
             if compressed is not None:
-                # Clear parameter reference but keep buffer allocated.
-                # The buffer (_tq_buf_*) stays in memory for reuse next forward.
                 getattr(mod, pname).data = torch.empty(0, device=compressed.device, dtype=compressed.dtype)
+                if not pool_buffers:
+                    # Free the decompression buffer to save GPU memory
+                    if hasattr(mod, buf_name):
+                        delattr(mod, buf_name)
         return output
 
     module.register_forward_pre_hook(pre_hook)
