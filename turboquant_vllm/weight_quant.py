@@ -28,6 +28,7 @@ _cuda_mod = None
 _cuda_available = None
 _triton_available = None
 _tq_fused_gemm_fn = None
+_tq_fwht_input_fn = None
 
 
 def _resolve_module(root, dotted_path: str):
@@ -255,28 +256,44 @@ class TurboQuantWrapper(nn.Module):
         return wrapper
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        global _triton_available, _tq_fused_gemm_fn
+        global _triton_available, _tq_fused_gemm_fn, _tq_fwht_input_fn
 
-        # Fastest path: Triton fused dequant-GEMM (no intermediate buffer)
+        # Lazy init Triton paths
         if _triton_available is None:
             try:
-                from turboquant_vllm.triton_ops import tq_fused_gemm
+                from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
                 _tq_fused_gemm_fn = tq_fused_gemm
+                _tq_fwht_input_fn = tq_fwht_input_gemm
                 _triton_available = True
             except (ImportError, Exception):
                 _triton_available = False
 
-        if _triton_available and x.is_cuda and self.bits != 3:
-            # Triton kernel doesn't support 3-bit sub-byte packing yet
-            try:
-                quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
-                return _tq_fused_gemm_fn(
-                    x, self.packed_weight, self.norms,
-                    quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                    group_size=self.group_size, bits=self.bits, bias=self.bias,
-                )
-            except (ValueError, RuntimeError):
-                pass  # Fall through to CUDA/PyTorch path for incompatible shapes
+        if _triton_available and x.is_cuda:
+            quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+
+            # Fastest path: FWHT on input + fused codebook dot product
+            # Rotates input once (cacheable across Q/K/V), no weight decompression.
+            # Supports TQ2 and TQ4 (not TQ3 sub-byte packing yet in the kernel).
+            if self.bits != 3:
+                try:
+                    return _tq_fwht_input_fn(
+                        x, self.packed_weight, self.norms,
+                        quantizer.signs1, quantizer.signs2, quantizer.centroids,
+                        group_size=self.group_size, bits=self.bits, bias=self.bias,
+                    )
+                except (ValueError, RuntimeError):
+                    pass
+
+            # Fallback Triton: fused dequant-GEMM (decompresses weights, but single kernel)
+            if self.bits != 3:
+                try:
+                    return _tq_fused_gemm_fn(
+                        x, self.packed_weight, self.norms,
+                        quantizer.signs1, quantizer.signs2, quantizer.centroids,
+                        group_size=self.group_size, bits=self.bits, bias=self.bias,
+                    )
+                except (ValueError, RuntimeError):
+                    pass
 
         cuda_mod = _get_cuda_module()
 
