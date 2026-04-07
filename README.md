@@ -167,6 +167,7 @@ If CUDA compilation fails, the system automatically falls back to PyTorch ops (s
 
 | Kernel | Purpose | Key operation |
 |--------|---------|---------------|
+| `_polar_fused_gemm_kernel` | FWHT-on-input GEMM (fastest) | Rotate input once → codebook lookup + norm scale + dot product (no weight decompression) |
 | `_tq_fused_gemm_kernel` | Fused weight dequant + matmul | Unpack → codebook → pre-computed rotation matrix → scale → GEMM accumulate |
 
 The fused Triton kernel is **10.5x faster** than separate dequant + cuBLAS GEMM (0.57ms vs 5.9ms for 4096×4096 on A100). It eliminates the intermediate decompressed weight buffer entirely. Uses a pre-computed rotation matrix (128×128 = 64 KB, computed once) instead of the WHT butterfly, turning the inverse rotation into a small matmul that Triton optimizes well.
@@ -174,7 +175,7 @@ The fused Triton kernel is **10.5x faster** than separate dequant + cuBLAS GEMM 
 The CUDA kernel (5x faster than PyTorch) serves as fallback when Triton is unavailable. Uses warp-shuffle operations for intra-warp butterfly stages, shared memory only for cross-warp stages.
 
 Design choices:
-- **Three-tier dispatch**: Triton fused GEMM → CUDA dequant + cuBLAS → PyTorch fallback. Auto-selected based on availability.
+- **Four-tier dispatch**: Triton FWHT-on-input (rotates input, no weight decompression) → Triton fused dequant-GEMM → CUDA dequant + cuBLAS → PyTorch fallback. Heuristic selects FWHT-on-input for large layers (>4K output features), dequant-GEMM for small. All tiers support TQ2/TQ3/TQ4 including 3-bit sub-byte packing.
 - **Walsh-Hadamard Transform** over dense rotation: O(d log d) vs O(d²). 896 FLOPs vs 16,384 for d=128.
 - **Separate K/V codebooks** in constant memory for asymmetric bit widths.
 - **Constant memory caching**: codebook and sign vectors only re-uploaded when config changes.
