@@ -588,89 +588,73 @@ def _reinit_computed_buffers(model, config, device):
         hidden_size = getattr(text_config, 'hidden_size', None)
     rope_config = text_config if text_config is not None else config
 
-    # Fix ALL zero-valued buffers that should be non-zero.
-    # After meta-device creation + Step 6 materialization, computed buffers
-    # are zeros. We identify them by name pattern and reinitialize.
+    # Fix computed buffers that aren't in the checkpoint.
+    # After meta-device creation + Step 6, these are zeros.
     fixed = 0
+
+    # 1. Re-initialize rotary embedding modules by calling their __init__.
+    # This correctly handles per-layer-type inv_freq with different head dims
+    # and rope thetas (e.g., Gemma 4: sliding=256/10000, full=512/1000000).
+    for mod_name, module in model.named_modules():
+        class_name = type(module).__name__.lower()
+        if 'rotary' in class_name and 'embedding' in class_name:
+            # Check if any buffer is zeroed (needs reinit)
+            has_zeroed = any(
+                isinstance(buf, torch.Tensor) and buf.numel() > 0 and buf.abs().max().item() == 0
+                for buf in module.buffers()
+            )
+            if has_zeroed:
+                # Re-run the module's __init__ to recompute inv_freq etc.
+                init_config = rope_config if rope_config is not None else config
+                try:
+                    module.__init__(init_config, device=device)
+                    n_bufs = sum(1 for _ in module.buffers())
+                    fixed += n_bufs
+                    logger.info("Re-initialized %s (%d buffers)", mod_name, n_bufs)
+                except Exception as e:
+                    logger.warning("Failed to reinit %s: %s", mod_name, e)
+
+    # 2. Fix embed_scale
+    if hidden_size:
+        for mod_name, module in model.named_modules():
+            if hasattr(module, 'embed_scale'):
+                scale = getattr(module, 'embed_scale')
+                if isinstance(scale, torch.Tensor) and scale.numel() > 0:
+                    try:
+                        if scale.item() == 0:
+                            module.embed_scale = torch.tensor(
+                                math.sqrt(hidden_size), dtype=torch.float32, device=device
+                            )
+                            fixed += 1
+                            logger.info("Fixed %s.embed_scale = %.4f", mod_name, math.sqrt(hidden_size))
+                    except RuntimeError:
+                        pass  # meta tensor, already handled by rotary reinit
+
+    # 3. Fix ClippableLinear bounds (should be -inf/+inf, not 0)
     for buf_name, buf in model.named_buffers():
-        if not isinstance(buf, torch.Tensor):
+        if not isinstance(buf, torch.Tensor) or buf.numel() != 1:
             continue
-        if buf.numel() == 0:
-            continue
-
         attr = buf_name.split(".")[-1]
-
-        # embed_scale: sqrt(hidden_size)
-        if attr == "embed_scale" and hidden_size and buf.numel() == 1:
-            if buf.item() == 0:
-                parts = buf_name.split(".")
-                mod = model
-                for p in parts[:-1]:
-                    mod = getattr(mod, p)
-                mod.embed_scale = torch.tensor(
-                    math.sqrt(hidden_size), dtype=torch.float32, device=device
-                )
-                fixed += 1
-                logger.info("Fixed %s = sqrt(%d) = %.4f", buf_name, hidden_size, math.sqrt(hidden_size))
-
-        # Rotary inv_freq (any variant: inv_freq, global_inv_freq, local_sliding_inv_freq, etc.)
-        elif "inv_freq" in attr and "original" not in attr:
-            if buf.abs().max().item() == 0:
-                head_dim = getattr(rope_config, 'head_dim', None)
-                if head_dim is None and hidden_size:
-                    head_dim = hidden_size // getattr(rope_config, 'num_attention_heads', 1)
-                rope_theta = getattr(rope_config, 'rope_theta', 10000.0)
-                if head_dim:
-                    new_inv_freq = 1.0 / (rope_theta ** (
-                        torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim
-                    ))
-                    # Truncate if buffer shape differs (some models use different sizes)
-                    if new_inv_freq.shape[0] != buf.shape[-1]:
-                        new_inv_freq = new_inv_freq[:buf.shape[-1]]
-                    parts = buf_name.split(".")
-                    mod = model
-                    for p in parts[:-1]:
-                        mod = getattr(mod, p)
-                    mod.register_buffer(attr, new_inv_freq.reshape(buf.shape))
-                    fixed += 1
-                    logger.info("Fixed %s: shape=%s from head_dim=%d, theta=%.0f",
-                                buf_name, list(buf.shape), head_dim, rope_theta)
-
-        # original_inv_freq: copy from inv_freq
-        elif "original_inv_freq" in attr:
-            if buf.abs().max().item() == 0:
-                # Find the corresponding inv_freq (same prefix, without "original_")
-                inv_attr = attr.replace("original_", "")
-                parts = buf_name.split(".")
-                mod = model
-                for p in parts[:-1]:
-                    mod = getattr(mod, p)
-                inv_freq = getattr(mod, inv_attr, None)
-                if inv_freq is not None and isinstance(inv_freq, torch.Tensor):
-                    mod.register_buffer(attr, inv_freq.clone())
-                    fixed += 1
-                    logger.info("Fixed %s: copied from %s", buf_name, inv_attr)
-
-        # ClippableLinear bounds: should be -inf/+inf, not 0
-        elif attr in ("input_min", "output_min") and buf.numel() == 1:
-            if buf.item() == 0:
-                parts = buf_name.split(".")
-                mod = model
-                for p in parts[:-1]:
-                    mod = getattr(mod, p)
-                mod.register_buffer(attr, torch.tensor(float('-inf'), device=device))
-                fixed += 1
-                logger.info("Fixed %s = -inf", buf_name)
-
-        elif attr in ("input_max", "output_max") and buf.numel() == 1:
-            if buf.item() == 0:
-                parts = buf_name.split(".")
-                mod = model
-                for p in parts[:-1]:
-                    mod = getattr(mod, p)
-                mod.register_buffer(attr, torch.tensor(float('inf'), device=device))
-                fixed += 1
-                logger.info("Fixed %s = +inf", buf_name)
+        try:
+            val = buf.item()
+        except RuntimeError:
+            continue
+        if attr in ("input_min", "output_min") and val == 0:
+            parts = buf_name.split(".")
+            mod = model
+            for p in parts[:-1]:
+                mod = getattr(mod, p)
+            mod.register_buffer(attr, torch.tensor(float('-inf'), device=device))
+            fixed += 1
+            logger.info("Fixed %s = -inf", buf_name)
+        elif attr in ("input_max", "output_max") and val == 0:
+            parts = buf_name.split(".")
+            mod = model
+            for p in parts[:-1]:
+                mod = getattr(mod, p)
+            mod.register_buffer(attr, torch.tensor(float('inf'), device=device))
+            fixed += 1
+            logger.info("Fixed %s = +inf", buf_name)
 
     if fixed > 0:
         logger.info("Re-initialized %d computed buffers", fixed)
