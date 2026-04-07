@@ -522,8 +522,13 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         logger.info("Materialized %d meta-device tensors", meta_fixed)
 
     # Re-initialize computed buffers that depend on config values.
-    # Gemma models have embed_scale = sqrt(hidden_size) and rotary inv_freq.
     _reinit_computed_buffers(model, config, device)
+
+    # Restore weight tying (e.g., lm_head shares weight with embed_tokens).
+    # Meta-device loading breaks tied weights because each gets materialized
+    # independently. Re-tie them based on the model config.
+    if getattr(config, 'tie_word_embeddings', True):
+        _restore_weight_tying(model)
 
     if device != "cpu" and torch.cuda.is_available():
         gpu_gb = torch.cuda.memory_allocated() / 1e9
@@ -535,6 +540,37 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
 
     model.eval()
     return model, tokenizer
+
+
+def _restore_weight_tying(model):
+    """Restore weight tying between embedding and lm_head.
+
+    Many models (Gemma, Llama, etc.) share the embedding weight with
+    the output projection (lm_head). Meta-device loading breaks this
+    tie because each parameter gets materialized independently.
+    """
+    # Find the embedding weight
+    embed_weight = None
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and 'embed_tokens' in name:
+            embed_weight = module.weight
+            break
+
+    if embed_weight is None:
+        return
+
+    # Find lm_head and tie its weight
+    lm_head = getattr(model, 'lm_head', None)
+    if lm_head is None:
+        # Some models nest lm_head differently
+        for name, module in model.named_modules():
+            if 'lm_head' in name and hasattr(module, 'weight'):
+                lm_head = module
+                break
+
+    if lm_head is not None and hasattr(lm_head, 'weight'):
+        lm_head.weight = embed_weight
+        logger.info("Restored weight tying: lm_head -> embed_tokens")
 
 
 def _reinit_computed_buffers(model, config, device):
