@@ -412,29 +412,26 @@ if HAS_TRITON:
         for g in range(n_groups):
             offs_k = tl.arange(0, BLOCK_K)
 
-            # Load rotated input tile: (BLOCK_M, BLOCK_K)
             x_ptrs = offs_m[:, None] * stride_xm + (g * BLOCK_K + offs_k)[None, :] * stride_xk
             x_tile = tl.load(x_rot_ptr + x_ptrs, mask=mask_m[:, None], other=0.0)
 
-            # Load and unpack codes: (BLOCK_N, BLOCK_K)
-            # NOTE: unpack logic mirrors _tq_fused_gemm_kernel. Triton @jit
-            # doesn't support shared helper functions, so the duplication is
-            # unavoidable. Keep the two in sync when changing bit-packing.
+            # packed_weight is (out_f * n_groups, packed_cols_per_group):
+            # row for output n, group g = n * n_groups + g
+            packed_row = offs_n * n_groups + g
             if BITS == 4:
                 byte_idx = offs_k // 2
                 is_hi = offs_k % 2
-                code_ptrs = offs_n[:, None] * stride_cn + byte_idx[None, :] * stride_ck
+                code_ptrs = packed_row[:, None] * stride_cn + byte_idx[None, :] * stride_ck
                 packed = tl.load(codes_ptr + code_ptrs, mask=mask_n[:, None], other=0).to(tl.int32)
                 codes = tl.where(is_hi[None, :] > 0, (packed >> 4) & 0xF, packed & 0xF)
             elif BITS == 2:
                 byte_idx = offs_k // 4
                 shift = (offs_k % 4).to(tl.int32) * 2
-                code_ptrs = offs_n[:, None] * stride_cn + byte_idx[None, :] * stride_ck
+                code_ptrs = packed_row[:, None] * stride_cn + byte_idx[None, :] * stride_ck
                 packed = tl.load(codes_ptr + code_ptrs, mask=mask_n[:, None], other=0).to(tl.int32)
                 codes = (packed >> shift[None, :]) & 0x3
             else:
-                # Fallback: 1 byte per code (works for any bit width)
-                code_ptrs = offs_n[:, None] * stride_cn + offs_k[None, :] * stride_ck
+                code_ptrs = packed_row[:, None] * stride_cn + offs_k[None, :] * stride_ck
                 codes = tl.load(codes_ptr + code_ptrs, mask=mask_n[:, None], other=0).to(tl.int32)
 
             # Centroid lookup: (BLOCK_N, BLOCK_K)
