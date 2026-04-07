@@ -6,7 +6,7 @@ TurboQuant+ compression for vLLM. Three features from one algorithm:
 - **KV cache compression** (3.7x) for more concurrent conversations on the same GPU
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models
 
-Gemma 4 26B: ~52 GB checkpoint → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. Serves at 14-17 tok/s on A100 in our tests.
+Gemma 4 26B: ~52 GB checkpoint → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. **+33% throughput** over BF16 at 16 concurrent requests (364 vs 275 tok/s on H100).
 
 Qwen3-30B: 61 GB → **13 GB** (4.6x). On MLA models, TQ+ KV cache works where vLLM's FP8 is broken.
 
@@ -228,7 +228,16 @@ Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Had
 
 Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
 
-Speed on A100: TQ3 serves at **14-17 tok/s**, faster than BF16 (9-16 tok/s). Smaller weights need less memory bandwidth.
+### Throughput (H100 80GB, vLLM 0.19.0, Gemma 4 26B)
+
+| Concurrency | BF16 tok/s | TQ3 Weight | TQ3 W+KV (K4/V3) | vs BF16 |
+|:-----------:|:----------:|:----------:|:-----------------:|:-------:|
+| 1 | 27.4 | 28.3 | 28.2 | +3% |
+| 4 | 103.3 | 103.4 | 102.9 | 0% |
+| 8 | 183.5 | 190.4 | 185.5 | +4% |
+| 16 | 274.5 | **357.2** | **364.2** | **+33%** |
+
+TQ3 is faster at every concurrency level. The gap widens under load because smaller weights need less HBM bandwidth, leaving more room for batching.
 
 3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
 
