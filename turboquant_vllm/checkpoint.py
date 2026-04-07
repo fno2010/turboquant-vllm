@@ -34,6 +34,28 @@ logger = logging.getLogger(__name__)
 _SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
 
 
+def _resolve_module(root, dotted_path: str):
+    """Navigate a module tree by dotted path, returning the final attribute.
+
+    Example: _resolve_module(model, "layers.0.self_attn") returns model.layers[0].self_attn
+    """
+    obj = root
+    for part in dotted_path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _resolve_parent_and_attr(root, dotted_path: str):
+    """Resolve a dotted path to (parent_module, attr_name).
+
+    Example: _resolve_parent_and_attr(model, "layers.0.weight")
+    returns (model.layers[0], "weight")
+    """
+    parts = dotted_path.split(".")
+    parent = _resolve_module(root, ".".join(parts[:-1])) if len(parts) > 1 else root
+    return parent, parts[-1]
+
+
 def save_tq3_checkpoint(
     model_id: str,
     output_dir: str,
@@ -66,14 +88,12 @@ def save_tq3_checkpoint(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Download config and tokenizer
     logger.info("Downloading config and tokenizer for %s...", model_id)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
-    # Find safetensors files
     api = HfApi()
     repo_files = api.list_repo_files(model_id)
     shard_files = sorted([f for f in repo_files if f.endswith(".safetensors")])
@@ -87,10 +107,7 @@ def save_tq3_checkpoint(
     else:
         weight_map = {}
 
-    # Create quantizer on CPU
     quantizer = PolarQuantTorch(group_size, bits, seed=42, device="cpu")
-
-    # Process each shard
     output_tensors = {}
     total_original = 0
     total_compressed = 0
@@ -106,7 +123,6 @@ def save_tq3_checkpoint(
                 original_bytes = tensor.numel() * tensor.element_size()
                 total_original += original_bytes
 
-                # Decide: compress or keep
                 # Compress 2D weight tensors AND 3D expert tensors (Gemma 4 stores
                 # experts as "experts.down_proj" without .weight suffix)
                 is_weight_2d = tensor_name.endswith(".weight") and tensor.dim() == 2
@@ -116,7 +132,6 @@ def save_tq3_checkpoint(
                 is_large = tensor.shape[-1] >= 128 or (tensor.dim() >= 2 and tensor.shape[-2] >= 128)
 
                 if is_weight and not is_skip and is_large:
-                    # Compress this weight
                     packed, norms = _compress_tensor(
                         tensor, quantizer, bits, group_size
                     )
@@ -132,21 +147,17 @@ def save_tq3_checkpoint(
                                     compressed_count,
                                     (total_original - total_compressed) / 1e9)
                 else:
-                    # Keep as FP16
                     if tensor.is_floating_point():
                         output_tensors[tensor_name] = tensor.half()
                     else:
                         output_tensors[tensor_name] = tensor
                     total_compressed += tensor.numel() * 2  # FP16
 
-    # Save compressed checkpoint
     logger.info("Saving %d tensors (%d compressed)...", len(output_tensors), compressed_count)
 
-    # Split into shards if too large for single file
     max_shard_size = 5 * 1024 * 1024 * 1024  # 5 GB per shard
     _save_sharded(output_tensors, output_dir, max_shard_size)
 
-    # Save TQ config
     tq_config = {
         "format": "tq3_native",
         "bits": bits,
@@ -214,7 +225,6 @@ def _save_sharded(tensors: dict, output_dir: str, max_shard_size: int):
     """Save tensors as sharded safetensors files."""
     from safetensors.torch import save_file
 
-    # Calculate sizes and assign to shards
     shards = []
     current_shard = {}
     current_size = 0
@@ -308,53 +318,69 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 if name.endswith(".tq_packed"):
                     packed_bases.add(name[:-len(".tq_packed")])
 
-    # Build map: weight_name -> (module_path, nn.Linear module)
-    # for all nn.Linear layers whose .weight has packed data
-    linear_map = {}  # weight_name -> module_path
+    linear_map = {}  # weight_name -> module_path for packed nn.Linear layers
     for mod_path, module in model.named_modules():
         if isinstance(module, nn.Linear):
             weight_name = mod_path + ".weight"
             if weight_name in packed_bases:
                 linear_map[weight_name] = mod_path
 
-    # Identify 3D expert weights (packed bases not covered by linear_map)
     expert_bases = packed_bases - set(linear_map.keys())
 
     logger.info("Found %d packed linears, %d packed expert tensors, %d regular tensors",
                 len(linear_map), len(expert_bases),
                 len(tensor_to_shard) - 2 * len(packed_bases))
 
-    # Ensure quantizer is initialized on target device
     _get_quantizer(group_size, bits, device)
+
+    # Steps 3-5: Collect all tensor keys needed, then load batched by shard
+    # (open each safetensors file once instead of once per tensor).
+
+    # Build the set of already-handled tensors for Step 5 filtering
+    handled_tensors = set()
+    for base in packed_bases:
+        handled_tensors.add(base + ".tq_packed")
+        handled_tensors.add(base + ".tq_norms")
+    for weight_name, mod_path in linear_map.items():
+        bias_key = mod_path + ".bias"
+        if bias_key in tensor_to_shard:
+            handled_tensors.add(bias_key)
+
+    # Identify regular tensors (Step 5) and validate they exist in the model
+    regular_tensor_names = []
+    for tensor_name in tensor_to_shard:
+        if tensor_name in handled_tensors:
+            continue
+        try:
+            _resolve_parent_and_attr(model, tensor_name)
+            regular_tensor_names.append(tensor_name)
+        except AttributeError:
+            logger.debug("Skipping tensor %s (no match in model)", tensor_name)
+
+    # Group ALL needed tensor keys by shard for batched loading
+    shard_to_keys: dict[str, list[str]] = {}
+    for key in list(handled_tensors) + regular_tensor_names:
+        shard_name = tensor_to_shard[key]
+        if shard_name not in shard_to_keys:
+            shard_to_keys[shard_name] = []
+        shard_to_keys[shard_name].append(key)
+
+    # Load all tensors, one shard open at a time
+    loaded: dict[str, torch.Tensor] = {}
+    for shard_name, keys in shard_to_keys.items():
+        shard_path = os.path.join(checkpoint_dir, shard_name)
+        with safe_open(shard_path, framework="pt", device=device) as f:
+            for key in keys:
+                loaded[key] = f.get_tensor(key)
 
     # Step 3: Replace nn.Linear layers with TurboQuantWrapper
     wrapped = 0
     for weight_name, mod_path in linear_map.items():
-        packed_key = weight_name + ".tq_packed"
-        norms_key = weight_name + ".tq_norms"
+        packed = loaded[weight_name + ".tq_packed"]
+        norms = loaded[weight_name + ".tq_norms"]
+        bias = loaded.get(mod_path + ".bias")
 
-        # Load packed data directly to GPU
-        shard_path = os.path.join(checkpoint_dir, tensor_to_shard[packed_key])
-        with safe_open(shard_path, framework="pt", device=device) as f:
-            packed = f.get_tensor(packed_key)
-        norms_shard = os.path.join(checkpoint_dir, tensor_to_shard[norms_key])
-        with safe_open(norms_shard, framework="pt", device=device) as f:
-            norms = f.get_tensor(norms_key)
-
-        # Check for bias
-        bias_key = mod_path + ".bias"
-        bias = None
-        if bias_key in tensor_to_shard:
-            bias_shard = os.path.join(checkpoint_dir, tensor_to_shard[bias_key])
-            with safe_open(bias_shard, framework="pt", device=device) as f:
-                bias = f.get_tensor(bias_key)
-
-        # Get original dimensions from model skeleton (meta device has shape info)
-        parts = mod_path.split(".")
-        meta_module = model
-        for part in parts:
-            meta_module = getattr(meta_module, part)
-
+        meta_module = _resolve_module(model, mod_path)
         wrapper = TurboQuantWrapper.from_packed(
             packed, norms,
             in_features=meta_module.in_features,
@@ -363,11 +389,8 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             bias=bias,
         )
 
-        # Replace in model
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], wrapper)
+        parent, attr = _resolve_parent_and_attr(model, mod_path)
+        setattr(parent, attr, wrapper)
         wrapped += 1
 
         if wrapped % 100 == 0:
@@ -377,26 +400,12 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     modules_to_hook = {}
     expert_count = 0
     for base_name in expert_bases:
-        packed_key = base_name + ".tq_packed"
-        norms_key = base_name + ".tq_norms"
+        packed = loaded[base_name + ".tq_packed"]
+        norms = loaded[base_name + ".tq_norms"]
 
-        parts = base_name.split(".")
-        param_name = parts[-1]
-        owner = model
-        for part in parts[:-1]:
-            owner = getattr(owner, part)
-
-        # Get original shape from meta parameter
+        owner, param_name = _resolve_parent_and_attr(model, base_name)
         meta_param = getattr(owner, param_name)
         orig_shape = meta_param.shape  # (n_experts, out_dim, in_dim)
-
-        # Load packed data to GPU
-        shard_path = os.path.join(checkpoint_dir, tensor_to_shard[packed_key])
-        with safe_open(shard_path, framework="pt", device=device) as f:
-            packed = f.get_tensor(packed_key)
-        norms_shard = os.path.join(checkpoint_dir, tensor_to_shard[norms_key])
-        with safe_open(norms_shard, framework="pt", device=device) as f:
-            norms = f.get_tensor(norms_key)
 
         compressed = Compressed3D.from_packed(
             packed, norms, shape=tuple(orig_shape),
@@ -404,7 +413,6 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         )
 
         setattr(owner, f"_tq_{param_name}", compressed)
-        # Replace meta parameter with empty GPU tensor
         if isinstance(meta_param, nn.Parameter):
             owner.register_parameter(
                 param_name,
@@ -435,38 +443,11 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         logger.info("Buffer pooling disabled (GPU %.0f GB < 60 GB)", gpu_mem_gb)
 
     # Step 5: Load remaining non-compressed tensors (embeddings, norms, biases)
-    # These are tensors NOT associated with any packed weight
-    handled_tensors = set()
-    for base in packed_bases:
-        handled_tensors.add(base + ".tq_packed")
-        handled_tensors.add(base + ".tq_norms")
-    # Biases already loaded with their linear wrappers
-    for weight_name, mod_path in linear_map.items():
-        bias_key = mod_path + ".bias"
-        if bias_key in tensor_to_shard:
-            handled_tensors.add(bias_key)
-
     regular_loaded = 0
-    for tensor_name, shard_name in tensor_to_shard.items():
-        if tensor_name in handled_tensors:
-            continue
-
-        # Navigate to the target parameter/buffer in the model
-        parts = tensor_name.split(".")
-        try:
-            target_module = model
-            for part in parts[:-1]:
-                target_module = getattr(target_module, part)
-            attr_name = parts[-1]
-            target = getattr(target_module, attr_name)
-        except AttributeError:
-            logger.debug("Skipping tensor %s (no match in model)", tensor_name)
-            continue
-
-        # Load tensor to GPU
-        shard_path = os.path.join(checkpoint_dir, shard_name)
-        with safe_open(shard_path, framework="pt", device=device) as f:
-            data = f.get_tensor(tensor_name)
+    for tensor_name in regular_tensor_names:
+        data = loaded[tensor_name]
+        target_module, attr_name = _resolve_parent_and_attr(model, tensor_name)
+        target = getattr(target_module, attr_name)
 
         if isinstance(target, nn.Parameter):
             if data.is_floating_point():
@@ -481,6 +462,8 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             setattr(target_module, attr_name, data)
         regular_loaded += 1
 
+    del loaded  # free references to loaded tensors
+
     logger.info("Loaded: %d wrapped linears, %d expert layers, %d regular tensors",
                 wrapped, expert_count, regular_loaded)
 
@@ -491,25 +474,18 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     meta_fixed = 0
     for name, param in list(model.named_parameters()):
         if param.device == torch.device("meta"):
+            target_module, attr_name = _resolve_parent_and_attr(model, name)
             new_param = nn.Parameter(
                 torch.zeros(param.shape, dtype=param.dtype, device=device),
                 requires_grad=False,
             )
-            parts = name.split(".")
-            target_module = model
-            for part in parts[:-1]:
-                target_module = getattr(target_module, part)
-            target_module.register_parameter(parts[-1], new_param)
+            target_module.register_parameter(attr_name, new_param)
             meta_fixed += 1
             logger.warning("Meta param zeroed (not in checkpoint): %s %s", name, list(param.shape))
 
     for name, buf in list(model.named_buffers()):
         if buf.device == torch.device("meta"):
-            parts = name.split(".")
-            target_module = model
-            for part in parts[:-1]:
-                target_module = getattr(target_module, part)
-            attr_name = parts[-1]
+            target_module, attr_name = _resolve_parent_and_attr(model, name)
             new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device=device)
             target_module.register_buffer(attr_name, new_buf)
             meta_fixed += 1
@@ -546,24 +522,24 @@ def _restore_weight_tying(model):
     the output projection (lm_head). Meta-device loading breaks this
     tie because each parameter gets materialized independently.
     """
-    # Find the embedding weight
     embed_weight = None
+    lm_head = None
+
+    # Single pass: find both embed_tokens and lm_head
     for name, module in model.named_modules():
-        if hasattr(module, 'weight') and 'embed_tokens' in name:
+        if embed_weight is None and hasattr(module, 'weight') and 'embed_tokens' in name:
             embed_weight = module.weight
+        if lm_head is None and 'lm_head' in name and hasattr(module, 'weight'):
+            lm_head = module
+        if embed_weight is not None and lm_head is not None:
             break
 
     if embed_weight is None:
         return
 
-    # Find lm_head and tie its weight
-    lm_head = getattr(model, 'lm_head', None)
+    # Fall back to direct attribute if not found via named_modules
     if lm_head is None:
-        # Some models nest lm_head differently
-        for name, module in model.named_modules():
-            if 'lm_head' in name and hasattr(module, 'weight'):
-                lm_head = module
-                break
+        lm_head = getattr(model, 'lm_head', None)
 
     if lm_head is not None and hasattr(lm_head, 'weight'):
         lm_head.weight = embed_weight
@@ -588,23 +564,30 @@ def _reinit_computed_buffers(model, config, device):
         hidden_size = getattr(text_config, 'hidden_size', None)
     rope_config = text_config if text_config is not None else config
 
-    # Fix computed buffers that aren't in the checkpoint.
-    # After meta-device creation + Step 6, these are zeros.
+    # After meta-device creation + Step 6, computed buffers are zeros.
+    # Single pass over named_modules handles rotary embeddings, embed_scale,
+    # and ClippableLinear bounds.
     fixed = 0
 
-    # 1. Re-initialize rotary embedding modules by calling their __init__.
-    # This correctly handles per-layer-type inv_freq with different head dims
-    # and rope thetas (e.g., Gemma 4: sliding=256/10000, full=512/1000000).
+    _INF_FIX_MAP = {
+        "input_min": float('-inf'),
+        "output_min": float('-inf'),
+        "input_max": float('inf'),
+        "output_max": float('inf'),
+    }
+
     for mod_name, module in model.named_modules():
         class_name = type(module).__name__.lower()
+
+        # 1. Re-initialize rotary embedding modules by calling their __init__.
+        # Handles per-layer-type inv_freq with different head dims and rope thetas
+        # (e.g., Gemma 4: sliding=256/10000, full=512/1000000).
         if 'rotary' in class_name and 'embedding' in class_name:
-            # Check if any buffer is zeroed (needs reinit)
             has_zeroed = any(
                 isinstance(buf, torch.Tensor) and buf.numel() > 0 and buf.abs().max().item() == 0
                 for buf in module.buffers()
             )
             if has_zeroed:
-                # Re-run the module's __init__ to recompute inv_freq etc.
                 init_config = rope_config if rope_config is not None else config
                 try:
                     module.__init__(init_config, device=device)
@@ -614,47 +597,31 @@ def _reinit_computed_buffers(model, config, device):
                 except Exception as e:
                     logger.warning("Failed to reinit %s: %s", mod_name, e)
 
-    # 2. Fix embed_scale
-    if hidden_size:
-        for mod_name, module in model.named_modules():
-            if hasattr(module, 'embed_scale'):
-                scale = getattr(module, 'embed_scale')
-                if isinstance(scale, torch.Tensor) and scale.numel() > 0:
-                    try:
-                        if scale.item() == 0:
-                            module.embed_scale = torch.tensor(
-                                math.sqrt(hidden_size), dtype=torch.float32, device=device
-                            )
-                            fixed += 1
-                            logger.info("Fixed %s.embed_scale = %.4f", mod_name, math.sqrt(hidden_size))
-                    except RuntimeError:
-                        pass  # meta tensor, already handled by rotary reinit
+        # 2. Fix embed_scale
+        if hidden_size and hasattr(module, 'embed_scale'):
+            scale = module.embed_scale
+            if isinstance(scale, torch.Tensor) and scale.numel() > 0:
+                if scale.device != torch.device("meta") and scale.item() == 0:
+                    module.embed_scale = torch.tensor(
+                        math.sqrt(hidden_size), dtype=torch.float32, device=device
+                    )
+                    fixed += 1
+                    logger.info("Fixed %s.embed_scale = %.4f", mod_name, math.sqrt(hidden_size))
 
-    # 3. Fix ClippableLinear bounds (should be -inf/+inf, not 0)
-    for buf_name, buf in model.named_buffers():
-        if not isinstance(buf, torch.Tensor) or buf.numel() != 1:
-            continue
-        attr = buf_name.split(".")[-1]
-        try:
-            val = buf.item()
-        except RuntimeError:
-            continue
-        if attr in ("input_min", "output_min") and val == 0:
-            parts = buf_name.split(".")
-            mod = model
-            for p in parts[:-1]:
-                mod = getattr(mod, p)
-            mod.register_buffer(attr, torch.tensor(float('-inf'), device=device))
-            fixed += 1
-            logger.info("Fixed %s = -inf", buf_name)
-        elif attr in ("input_max", "output_max") and val == 0:
-            parts = buf_name.split(".")
-            mod = model
-            for p in parts[:-1]:
-                mod = getattr(mod, p)
-            mod.register_buffer(attr, torch.tensor(float('inf'), device=device))
-            fixed += 1
-            logger.info("Fixed %s = +inf", buf_name)
+        # 3. Fix ClippableLinear bounds (should be -inf/+inf, not 0).
+        # Check direct buffers on this module only (avoids re-iterating named_buffers).
+        for attr, inf_val in _INF_FIX_MAP.items():
+            buf = getattr(module, attr, None)
+            if buf is None or not isinstance(buf, torch.Tensor) or buf.numel() != 1:
+                continue
+            try:
+                if buf.item() == 0:
+                    module.register_buffer(attr, torch.tensor(inf_val, device=device))
+                    fixed += 1
+                    logger.info("Fixed %s.%s = %s", mod_name, attr,
+                                "-inf" if inf_val < 0 else "+inf")
+            except RuntimeError:
+                continue
 
     if fixed > 0:
         logger.info("Re-initialized %d computed buffers", fixed)

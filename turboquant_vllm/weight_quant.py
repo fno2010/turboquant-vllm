@@ -28,6 +28,21 @@ _triton_available = None
 _tq_fused_gemm_fn = None
 
 
+def _resolve_module(root, dotted_path: str):
+    """Navigate a module tree by dotted path, returning the final attribute."""
+    obj = root
+    for part in dotted_path.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _resolve_parent_and_attr(root, dotted_path: str):
+    """Resolve a dotted path to (parent_module, attr_name)."""
+    parts = dotted_path.split(".")
+    parent = _resolve_module(root, ".".join(parts[:-1])) if len(parts) > 1 else root
+    return parent, parts[-1]
+
+
 def _get_cuda_module():
     """Lazy-load the CUDA weight dequant kernel."""
     global _cuda_mod, _cuda_available
@@ -173,7 +188,6 @@ class TurboQuantWrapper(nn.Module):
         else:
             padded = weight
 
-        # Reshape to (out_dim * n_groups, group_size) for batch quantization
         grouped = padded.reshape(-1, group_size)
 
         if rotation is not None:
@@ -190,7 +204,6 @@ class TurboQuantWrapper(nn.Module):
             packed = pack_indices(indices, bits)
             norms = norms_raw.reshape(out_dim, self.n_groups)
 
-        # Memory stats (norms stored as FP16 when learned rotation, FP32 otherwise)
         original_bytes = weight.numel() * weight.element_size()
         norm_bytes = norms.numel() * norms.element_size()
         compressed_bytes = packed.numel() + norm_bytes
@@ -375,47 +388,41 @@ class Compressed3D:
         """
         n_experts, out_dim, in_dim = self.shape
 
-        if True:  # Always use chunked PyTorch path for correctness and memory efficiency
-            # Chunked decompression to limit peak GPU memory.
-            # Process a few experts at a time instead of all at once,
-            # so FP32 temporaries stay small (~0.5 GB per chunk vs ~8 GB all at once).
-            output_dtype = self.dtype
-            if buf is not None and buf.shape == (n_experts, out_dim, in_dim):
-                output = buf
-            else:
-                output = torch.empty(n_experts, out_dim, in_dim,
-                                     dtype=output_dtype, device=self.packed.device)
+        # Chunked: process 8 experts at a time to keep FP32 temporaries
+        # small (~0.5 GB per chunk vs ~8 GB all at once).
+        output_dtype = self.dtype
+        if buf is not None and buf.shape == (n_experts, out_dim, in_dim):
+            output = buf
+        else:
+            output = torch.empty(n_experts, out_dim, in_dim,
+                                 dtype=output_dtype, device=self.packed.device)
 
-            quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
-            chunk_experts = max(1, min(8, n_experts))  # 8 experts per chunk
-            # packed is (total_groups, packed_cols) where total_groups = n_experts * out_dim * n_groups
-            # norms is (n_experts * out_dim, n_groups)
-            groups_per_expert = out_dim * self.n_groups
+        quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
+        chunk_experts = max(1, min(8, n_experts))
+        groups_per_expert = out_dim * self.n_groups
 
-            for start in range(0, n_experts, chunk_experts):
-                end = min(start + chunk_experts, n_experts)
+        for start in range(0, n_experts, chunk_experts):
+            end = min(start + chunk_experts, n_experts)
 
-                # Slice packed by group index
-                start_group = start * groups_per_expert
-                end_group = end * groups_per_expert
-                chunk_packed = self.packed[start_group:end_group]
+            start_group = start * groups_per_expert
+            end_group = end * groups_per_expert
+            chunk_packed = self.packed[start_group:end_group]
 
-                # Slice norms by row index
-                start_row = start * out_dim
-                end_row = end * out_dim
-                chunk_norms = self.norms[start_row:end_row]
+            start_row = start * out_dim
+            end_row = end * out_dim
+            chunk_norms = self.norms[start_row:end_row]
 
-                chunk_idx = unpack_indices(chunk_packed, self.bits, self.group_size)
-                chunk_groups = quantizer.dequantize(chunk_idx, chunk_norms.reshape(-1))
-                del chunk_idx
+            chunk_idx = unpack_indices(chunk_packed, self.bits, self.group_size)
+            chunk_groups = quantizer.dequantize(chunk_idx, chunk_norms.reshape(-1))
+            del chunk_idx
 
-                chunk_result = chunk_groups.reshape(-1, self.padded_in)[:, :self.in_dim]
-                output[start:end] = chunk_result.reshape(
-                    end - start, out_dim, in_dim
-                ).to(output_dtype)
-                del chunk_groups, chunk_result
+            chunk_result = chunk_groups.reshape(-1, self.padded_in)[:, :self.in_dim]
+            output[start:end] = chunk_result.reshape(
+                end - start, out_dim, in_dim
+            ).to(output_dtype)
+            del chunk_groups, chunk_result
 
-            return output
+        return output
 
     @property
     def ratio(self) -> float:
@@ -433,10 +440,7 @@ def _compress_3d_param(module: nn.Module, param_name: str, bits: int, group_size
     param = getattr(module, param_name)
     compressed = Compressed3D(param.data, bits, group_size)
 
-    # Store compressed data on the module
     setattr(module, f"_tq_{param_name}", compressed)
-
-    # Replace parameter with empty to free memory
     param.data = torch.empty(0, device=param.device, dtype=param.dtype)
 
     return compressed.original_bytes, compressed.compressed_bytes
@@ -618,10 +622,7 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
             module.weight.data.zero_()
             pruned_count += module.weight.numel()
 
-        parts = name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
+        parent, attr_name = _resolve_parent_and_attr(model, name)
 
         original_bytes = module.weight.numel() * module.weight.element_size()
 
@@ -638,7 +639,7 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
         rotation = learned_rotations.get(name) if learned_rotations else None
         wrapper = TurboQuantWrapper(module, bits=tensor_bits, group_size=group_size,
                                     rotation=rotation)
-        setattr(parent, parts[-1], wrapper)
+        setattr(parent, attr_name, wrapper)
 
         compressed_bytes = wrapper.packed_weight.numel() + wrapper.norms.numel() * wrapper.norms.element_size()
         total_original += original_bytes
@@ -691,12 +692,7 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
         if any(p in name.lower() for p in _SKIP_PATTERNS):
             continue
 
-        # Find the module that owns this parameter
-        parts = name.split(".")
-        param_name = parts[-1]
-        owner = model
-        for part in parts[:-1]:
-            owner = getattr(owner, part)
+        owner, param_name = _resolve_parent_and_attr(model, name)
 
         # Apply expert pruning in-place if mask available
         if prune_experts > 0 and name in param_to_mask:
