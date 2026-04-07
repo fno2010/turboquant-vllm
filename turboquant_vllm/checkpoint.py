@@ -491,7 +491,6 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     meta_fixed = 0
     for name, param in list(model.named_parameters()):
         if param.device == torch.device("meta"):
-            # Re-initialize with zeros on target device
             new_param = nn.Parameter(
                 torch.zeros(param.shape, dtype=param.dtype, device=device),
                 requires_grad=False,
@@ -502,21 +501,19 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 target_module = getattr(target_module, part)
             target_module.register_parameter(parts[-1], new_param)
             meta_fixed += 1
+            logger.warning("Meta param zeroed (not in checkpoint): %s %s", name, list(param.shape))
 
     for name, buf in list(model.named_buffers()):
         if buf.device == torch.device("meta"):
-            # Re-create buffer on target device
             parts = name.split(".")
             target_module = model
             for part in parts[:-1]:
                 target_module = getattr(target_module, part)
             attr_name = parts[-1]
-
-            # Try to re-compute the buffer by calling the module's reset method
-            # or just create a zero tensor with the right shape/dtype
             new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device=device)
             target_module.register_buffer(attr_name, new_buf)
             meta_fixed += 1
+            logger.warning("Meta buffer zeroed (not in checkpoint): %s %s", name, list(buf.shape))
 
     if meta_fixed > 0:
         logger.info("Materialized %d meta-device tensors", meta_fixed)
