@@ -229,10 +229,34 @@ Speed on A100: TQ3 serves at **14-17 tok/s**, faster than BF16 (9-16 tok/s). Sma
 
 3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
 
+### Native TQ3 checkpoint (small GPUs)
+
+Runtime compression (`enable_weight_quantization`) needs the full BF16 checkpoint in GPU memory during loading. For GPUs that can't fit the original checkpoint (e.g., L40S 48GB for a 52 GB model), use a native TQ3 checkpoint instead:
+
+```python
+from turboquant_vllm import load_tq3_model
+
+# 12 GB checkpoint → 13.5 GB GPU memory, ~12 seconds
+model, tokenizer = load_tq3_model("varjosoft/gemma-4-26B-A4B-it-TQ3-native")
+output = model.generate(...)
+```
+
+The native checkpoint stores packed 3-bit indices directly (12 GB on disk). The loader creates the model on a meta device (zero memory), loads packed weights to GPU, and decompresses on-the-fly during each forward pass.
+
+Create your own native checkpoint:
+```python
+from turboquant_vllm.checkpoint import save_tq3_checkpoint
+save_tq3_checkpoint("google/gemma-4-26B-A4B-it", "./gemma4-tq3-native")
+# CPU only, ~60 GB RAM, ~2 minutes
+```
+
+**Important: Gemma 4 requires `transformers >= 5.5.0`** (the `gemma4` model type was added in that version). vLLM 0.19.0 pins `transformers < 5`, so Gemma 4 loading requires a manual override: `pip install 'transformers>=5.5'`.
+
 ### Limitations
 
 - **V100 16GB**: model loads (12 GB) but not enough room for KV cache. Minimum practical is 24 GB.
 - **TQ2 (2-bit)** destroys quality. 4 centroids too few for MLP weight distributions.
+- **Native TQ3 inference speed** is limited by PyTorch-based expert decompression (CUDA 3D kernel optimization pending).
 
 ## Expert pruning (REAP)
 
