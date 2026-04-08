@@ -44,10 +44,12 @@ def _resolve_module(root, dotted_path: str):
     for part in dotted_path.split("."):
         try:
             obj = getattr(obj, part)
-        except AttributeError:
-            # Some MoE implementations use plain lists or custom containers
-            # where getattr("5") fails but obj[5] works
-            obj = obj[int(part)]
+        except (AttributeError, TypeError):
+            # ModuleList/plain lists: getattr("5") fails but obj[5] works
+            try:
+                obj = obj[int(part)]
+            except (IndexError, ValueError, TypeError):
+                raise AttributeError(f"Cannot resolve '{part}' in {type(obj).__name__}")
     return obj
 
 
