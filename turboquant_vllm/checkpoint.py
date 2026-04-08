@@ -174,12 +174,11 @@ def save_tq3_checkpoint(
 
     # Rename shards with correct total count
     total_shards = shard_idx
-    for old_name in list(weight_map.values()):
+    for old_name in sorted(set(weight_map.values())):
         new_name = old_name.replace("NNNNN", f"{total_shards:05d}")
         if old_name != new_name:
-            old_path = os.path.join(output_dir, old_name)
-            new_path = os.path.join(output_dir, new_name)
-            os.rename(old_path, new_path)
+            os.rename(os.path.join(output_dir, old_name),
+                      os.path.join(output_dir, new_name))
             for k in weight_map:
                 if weight_map[k] == old_name:
                     weight_map[k] = new_name
