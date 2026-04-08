@@ -8,7 +8,10 @@ Environment variables:
     TQ_WEIGHT_BITS: quantization bits (2-8), triggers the hook
     TQ_WEIGHT_GROUP_SIZE: group size (default 128)
 """
+import logging
 import os
+
+logger = logging.getLogger("turboquant_vllm.plugin")
 
 _patched = False
 
@@ -19,6 +22,7 @@ def register():
 
     bits = os.environ.get("TQ_WEIGHT_BITS")
     if bits is None:
+        logger.debug("TQ_WEIGHT_BITS not set, plugin inactive")
         return
 
     if _patched:
@@ -31,5 +35,7 @@ def register():
     try:
         from turboquant_vllm.weight_quant import patch_vllm_loader
         patch_vllm_loader(bits=bits, group_size=group_size, min_size=128)
-    except ImportError:
-        return
+        logger.info("TurboQuant TQ%d-g%d weight compression registered (pid=%d)",
+                     bits, group_size, os.getpid())
+    except ImportError as e:
+        logger.warning("Failed to register TurboQuant plugin: %s", e)

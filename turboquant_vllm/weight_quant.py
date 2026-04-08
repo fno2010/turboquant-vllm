@@ -265,8 +265,10 @@ class TurboQuantWrapper(nn.Module):
                 _tq_fused_gemm_fn = tq_fused_gemm
                 _tq_fwht_input_fn = tq_fwht_input_gemm
                 _triton_available = True
+                logger.info("Triton kernels available (FWHT-on-input + dequant-GEMM)")
             except (ImportError, Exception):
                 _triton_available = False
+                logger.info("Triton not available, using CUDA/PyTorch fallback")
 
         if _triton_available and x.is_cuda:
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
@@ -778,7 +780,12 @@ def patch_vllm_loader(**replace_kwargs) -> None:
 
     def patched_process_weights(model, model_config, target_device):
         _original(model, model_config, target_device)
-        _replace_linear_layers(model, **replace_kwargs)
+        logger.info("Applying TurboQuant weight compression...")
+        count = _replace_linear_layers(model, **replace_kwargs)
+        if count > 0:
+            import torch
+            mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            logger.info("TurboQuant: %d layers compressed, GPU memory: %.1f GB", count, mem_gb)
 
     loader_utils.process_weights_after_loading = patched_process_weights
 
