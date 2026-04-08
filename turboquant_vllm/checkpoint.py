@@ -61,29 +61,25 @@ def save_tq3_checkpoint(
     output_dir: str,
     bits: int = 3,
     group_size: int = 128,
+    max_shard_bytes: int = 5 * 1024 * 1024 * 1024,
 ):
     """Convert a HuggingFace checkpoint to native TQ3 packed format.
 
-    Reads the original safetensors lazy (one tensor at a time), compresses
-    weights on CPU, and writes a ~12 GB checkpoint. Peak memory: ~1 GB
-    (one weight tensor + its compressed form).
-
-    The output is a standard safetensors file where:
-    - Weight tensors are replaced with .tq_packed (uint8) and .tq_norms (float32)
-    - Non-weight tensors are stored as FP16
-    - A tq_config.json records compression parameters
+    Streams tensors: reads one at a time, compresses, writes to output shards
+    incrementally. Peak memory: one tensor + its compressed form (~8 GB for
+    large MoE expert tensors). Handles TB-scale models (e.g., GLM-5.1 769B).
 
     Args:
         model_id: HuggingFace model ID or local path.
         output_dir: Where to save the TQ3 checkpoint.
         bits: Quantization bits (default 3).
         group_size: Group size (default 128).
+        max_shard_bytes: Max bytes per output shard (default 5 GB).
     """
     from safetensors import safe_open
     from safetensors.torch import save_file
     from huggingface_hub import hf_hub_download, HfApi
     from transformers import AutoConfig, AutoTokenizer
-    from turboquant_vllm.weight_quant import pack_indices
     from turboquant_vllm.torch_ops import PolarQuantTorch
 
     os.makedirs(output_dir, exist_ok=True)
@@ -97,21 +93,42 @@ def save_tq3_checkpoint(
     api = HfApi()
     repo_files = api.list_repo_files(model_id)
     shard_files = sorted([f for f in repo_files if f.endswith(".safetensors")])
-    index_file = [f for f in repo_files if f == "model.safetensors.index.json"]
-
-    if index_file:
-        index_path = hf_hub_download(model_id, "model.safetensors.index.json")
-        with open(index_path) as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map", {})
-    else:
-        weight_map = {}
 
     quantizer = PolarQuantTorch(group_size, bits, seed=42, device="cpu")
-    output_tensors = {}
+
+    # Streaming: accumulate tensors into current shard, flush when full
+    current_shard: dict[str, torch.Tensor] = {}
+    current_shard_bytes = 0
+    shard_idx = 0
+    weight_map: dict[str, str] = {}
+    total_size = 0
     total_original = 0
     total_compressed = 0
     compressed_count = 0
+
+    def _flush_shard():
+        nonlocal current_shard, current_shard_bytes, shard_idx
+        if not current_shard:
+            return
+        shard_idx += 1
+        shard_name = f"model-{shard_idx:05d}-of-NNNNN.safetensors"
+        shard_path = os.path.join(output_dir, shard_name)
+        save_file(current_shard, shard_path)
+        for name in current_shard:
+            weight_map[name] = shard_name
+        logger.info("  Wrote shard %d: %d tensors, %.1f GB",
+                     shard_idx, len(current_shard), current_shard_bytes / 1e9)
+        current_shard = {}
+        current_shard_bytes = 0
+
+    def _add_tensor(name: str, tensor: torch.Tensor):
+        nonlocal current_shard, current_shard_bytes, total_size
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        if current_shard_bytes + tensor_bytes > max_shard_bytes and current_shard:
+            _flush_shard()
+        current_shard[name] = tensor
+        current_shard_bytes += tensor_bytes
+        total_size += tensor_bytes
 
     for shard_name in shard_files:
         logger.info("Processing shard: %s", shard_name)
@@ -123,8 +140,6 @@ def save_tq3_checkpoint(
                 original_bytes = tensor.numel() * tensor.element_size()
                 total_original += original_bytes
 
-                # Compress 2D weight tensors AND 3D expert tensors (Gemma 4 stores
-                # experts as "experts.down_proj" without .weight suffix)
                 is_weight_2d = tensor_name.endswith(".weight") and tensor.dim() == 2
                 is_expert_3d = tensor.dim() == 3 and "expert" in tensor_name.lower()
                 is_weight = is_weight_2d or is_expert_3d
@@ -135,8 +150,8 @@ def save_tq3_checkpoint(
                     packed, norms = _compress_tensor(
                         tensor, quantizer, bits, group_size
                     )
-                    output_tensors[tensor_name + ".tq_packed"] = packed
-                    output_tensors[tensor_name + ".tq_norms"] = norms
+                    _add_tensor(tensor_name + ".tq_packed", packed)
+                    _add_tensor(tensor_name + ".tq_norms", norms)
 
                     comp_bytes = packed.numel() + norms.numel() * norms.element_size()
                     total_compressed += comp_bytes
@@ -148,15 +163,39 @@ def save_tq3_checkpoint(
                                     (total_original - total_compressed) / 1e9)
                 else:
                     if tensor.is_floating_point():
-                        output_tensors[tensor_name] = tensor.half()
+                        _add_tensor(tensor_name, tensor.half())
                     else:
-                        output_tensors[tensor_name] = tensor
-                    total_compressed += tensor.numel() * 2  # FP16
+                        _add_tensor(tensor_name, tensor)
+                    total_compressed += tensor.numel() * 2
 
-    logger.info("Saving %d tensors (%d compressed)...", len(output_tensors), compressed_count)
+                del tensor  # free input tensor immediately
 
-    max_shard_size = 5 * 1024 * 1024 * 1024  # 5 GB per shard
-    _save_sharded(output_tensors, output_dir, max_shard_size)
+    _flush_shard()  # write remaining tensors
+
+    # Rename shards with correct total count
+    total_shards = shard_idx
+    for old_name in list(weight_map.values()):
+        new_name = old_name.replace("NNNNN", f"{total_shards:05d}")
+        if old_name != new_name:
+            old_path = os.path.join(output_dir, old_name)
+            new_path = os.path.join(output_dir, new_name)
+            os.rename(old_path, new_path)
+            for k in weight_map:
+                if weight_map[k] == old_name:
+                    weight_map[k] = new_name
+
+    # Write index
+    if total_shards > 1:
+        index = {
+            "metadata": {"total_size": total_size},
+            "weight_map": weight_map,
+        }
+        with open(os.path.join(output_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump(index, f, indent=2)
+    elif total_shards == 1:
+        # Single shard: rename to model.safetensors
+        shard_path = os.path.join(output_dir, list(set(weight_map.values()))[0])
+        os.rename(shard_path, os.path.join(output_dir, "model.safetensors"))
 
     tq_config = {
         "format": "tq3_native",
