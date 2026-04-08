@@ -281,26 +281,38 @@ def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
     return _rotation_matrix_cache[key]
 
 
+def _tensor_fingerprint(x: torch.Tensor) -> torch.Tensor:
+    """Cheap content fingerprint: first 4 + last 4 elements of flattened tensor."""
+    flat = x.detach().flatten()
+    n = min(4, flat.numel())
+    return torch.cat([flat[:n], flat[-n:]]).cpu()
+
+
 class FWHTInputCache:
     """Cache rotated input across Q/K/V projections sharing the same hidden state.
 
     Saves ~67% of FWHT calls in a standard attention block.
-    Clear between model forward passes via a pre-hook.
-
-    Identity check uses data_ptr + storage data_ptr + shape to avoid
-    false hits from recycled pointers or same-shape different tensors.
+    Uses pointer + shape + content fingerprint to detect stale entries
+    from PyTorch memory reuse across forward passes.
     """
 
     def __init__(self):
         self._ptr: int = -1
         self._storage_ptr: int = -1
         self._shape: tuple = ()
+        self._fingerprint: torch.Tensor | None = None
         self._result: torch.Tensor | None = None
 
     def get(self, x: torch.Tensor) -> torch.Tensor | None:
         if (x.data_ptr() == self._ptr
                 and x.untyped_storage().data_ptr() == self._storage_ptr
                 and x.shape == self._shape):
+            # Verify content hasn't changed (catches memory reuse across forward passes).
+            # Cheap: compare first + last few elements instead of full tensor.
+            if self._fingerprint is not None:
+                fp = _tensor_fingerprint(x)
+                if not torch.equal(fp, self._fingerprint):
+                    return None
             return self._result
         return None
 
@@ -308,12 +320,14 @@ class FWHTInputCache:
         self._ptr = x.data_ptr()
         self._storage_ptr = x.untyped_storage().data_ptr()
         self._shape = x.shape
+        self._fingerprint = _tensor_fingerprint(x)
         self._result = result
 
     def clear(self):
         self._ptr = -1
         self._storage_ptr = -1
         self._shape = ()
+        self._fingerprint = None
         result = self._result
         self._result = None
         del result
