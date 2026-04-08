@@ -287,6 +287,7 @@ def patch_vllm_attention(
             Identify via attention entropy analysis or set empirically.
             Default None (compress all heads).
     """
+    import os
     global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers, _fp16_heads
     _k_bits = k_bits
     _v_bits = v_bits
@@ -295,6 +296,11 @@ def patch_vllm_attention(
     _sink_tokens = sink_tokens
     _boundary_layers = boundary_layers
     _fp16_heads = fp16_heads or set()
+
+    # Set env vars so the vLLM plugin can re-apply in spawned subprocesses
+    os.environ["TQ_KV_K_BITS"] = str(k_bits)
+    os.environ["TQ_KV_V_BITS"] = str(v_bits)
+    os.environ["TQ_KV_NORM_CORRECTION"] = "1" if norm_correction else "0"
 
     _try_cuda_init()
 
