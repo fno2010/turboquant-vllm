@@ -72,9 +72,11 @@ def register():
         k_bits = int(kv_k_bits)
         v_bits = int(os.environ.get("TQ_KV_V_BITS", str(k_bits)))
         norm_correction = os.environ.get("TQ_KV_NORM_CORRECTION", "1") == "1"
+        rotation = os.environ.get("TQ_KV_ROTATION", "wht")
         try:
             from turboquant_vllm.vllm_patch import patch_vllm_attention
-            patch_vllm_attention(k_bits=k_bits, v_bits=v_bits, norm_correction=norm_correction)
+            patch_vllm_attention(k_bits=k_bits, v_bits=v_bits,
+                                 norm_correction=norm_correction, rotation=rotation)
             logger.info("TurboQuant K%d/V%d KV cache compression registered (pid=%d)",
                          k_bits, v_bits, os.getpid())
         except ImportError as e:

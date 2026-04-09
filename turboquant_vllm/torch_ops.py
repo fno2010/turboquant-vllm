@@ -385,6 +385,7 @@ class KVCacheCompressorTorch:
         use_cuda: bool = False,
         norm_correction: bool = True,
         use_qjl: bool = False,
+        rotation: str = "wht",
     ):
         """
         Args:
@@ -394,6 +395,8 @@ class KVCacheCompressorTorch:
             use_qjl: Use QJL residual correction for K cache. Default False
                 (QJL hurts quality per TheTom's turbo4-resurrection research).
                 When False, all k_bits go to PolarQuant centroids.
+            rotation: 'wht' (Walsh-Hadamard, O(d log d)) or 'planar'
+                (2D Givens, O(d)). Planar is faster with comparable quality.
         """
         self.head_dim = head_dim
         self.k_bits = k_bits
@@ -402,22 +405,24 @@ class KVCacheCompressorTorch:
         self.use_cuda = use_cuda
         self.norm_correction = norm_correction
         self.use_qjl = use_qjl
+        self.rotation = rotation
         self._cuda_mod = None
 
-        if use_cuda:
+        if use_cuda and rotation == "wht":
+            # CUDA kernels only support WHT rotation currently
             self._init_cuda(head_dim, k_bits, v_bits, seed, device)
 
         if use_qjl and k_bits >= 2:
-            # Legacy: K = PolarQuant(k_bits-1) + QJL(1 bit)
-            self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed, device=device)
+            self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed,
+                                           device=device, rotation=rotation)
             self.k_qjl = QJLTorch(head_dim, seed=seed + 1000, device=device)
         else:
-            # Default: K = PolarQuant(k_bits), no QJL. All bits for centroids.
-            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed, device=device)
+            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed,
+                                           device=device, rotation=rotation)
             self.k_qjl = None
 
-        # V: PolarQuant MSE-only at full v_bits
-        self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500, device=device)
+        self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500,
+                                       device=device, rotation=rotation)
 
     def _init_cuda(self, head_dim, k_bits, v_bits, seed, device):
         """Initialize CUDA kernels with matching codebooks and rotations."""
