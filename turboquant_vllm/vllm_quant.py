@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -241,4 +240,30 @@ def register():
                 output = output + bias
             return output
 
+    # Patch the weight loader to remap old-style checkpoint names
+    # Old: model.layers.0.self_attn.q_proj.weight.tq_packed
+    # New: model.layers.0.self_attn.q_proj.tq_packed
+    _patch_weight_name_remapping()
+
     logger.info("TurboQuant quantization config registered with vLLM")
+
+
+def _patch_weight_name_remapping():
+    """Monkey-patch vLLM's weight iterator to remap old TQ checkpoint names."""
+    try:
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    except ImportError:
+        return
+
+    _original_get_all_weights = DefaultModelLoader.get_all_weights
+
+    def _remapped_get_all_weights(self, model_config, model):
+        for name, tensor in _original_get_all_weights(self, model_config, model):
+            # Remap old-style .weight.tq_packed → .tq_packed
+            if ".weight.tq_packed" in name:
+                name = name.replace(".weight.tq_packed", ".tq_packed")
+            elif ".weight.tq_norms" in name:
+                name = name.replace(".weight.tq_norms", ".tq_norms")
+            yield name, tensor
+
+    DefaultModelLoader.get_all_weights = _remapped_get_all_weights
