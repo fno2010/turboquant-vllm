@@ -73,8 +73,8 @@ def _get_cuda_module():
 
 
 def _get_quantizer(group_size: int, bits: int, device: str) -> PolarQuantTorch:
-    """Get or create a PolarQuant quantizer for a given group size and bit width."""
-    key = (group_size, bits)
+    """Get or create a PolarQuant quantizer for a given config and device."""
+    key = (group_size, bits, device)
     if key not in _quantizers:
         _quantizers[key] = PolarQuantTorch(group_size, bits, seed=42, device=device)
     return _quantizers[key]
