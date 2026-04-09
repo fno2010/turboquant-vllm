@@ -105,26 +105,85 @@ def _next_power_of_2(n: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Rotation backends: WHT (original) and Planar (RotorQuant-inspired)
+# ---------------------------------------------------------------------------
+
+
+def _planar_rotate(x: torch.Tensor, cos_sin: torch.Tensor) -> torch.Tensor:
+    """Apply 2D Givens rotation to pairs of elements. O(d), 4 FMAs per pair.
+
+    x: (batch, dim)
+    cos_sin: (n_pairs, 2) as [cos θ, sin θ]
+    Returns: (batch, dim) rotated
+    """
+    n_pairs = cos_sin.shape[0]
+    cos_t = cos_sin[:, 0]  # (n_pairs,)
+    sin_t = cos_sin[:, 1]
+    v0 = x[:, 0::2][:, :n_pairs]  # even indices
+    v1 = x[:, 1::2][:, :n_pairs]  # odd indices
+    r0 = cos_t * v0 - sin_t * v1
+    r1 = sin_t * v0 + cos_t * v1
+    out = x.clone()
+    out[:, 0::2][:, :n_pairs] = r0
+    out[:, 1::2][:, :n_pairs] = r1
+    return out
+
+
+def _planar_rotate_inverse(x: torch.Tensor, cos_sin: torch.Tensor) -> torch.Tensor:
+    """Inverse 2D Givens rotation (negate sin). O(d), 4 FMAs per pair."""
+    n_pairs = cos_sin.shape[0]
+    cos_t = cos_sin[:, 0]
+    sin_t = cos_sin[:, 1]
+    v0 = x[:, 0::2][:, :n_pairs]
+    v1 = x[:, 1::2][:, :n_pairs]
+    r0 = cos_t * v0 + sin_t * v1
+    r1 = -sin_t * v0 + cos_t * v1
+    out = x.clone()
+    out[:, 0::2][:, :n_pairs] = r0
+    out[:, 1::2][:, :n_pairs] = r1
+    return out
+
+
+# ---------------------------------------------------------------------------
 # PolarQuant: rotation + optimal scalar quantization
 # ---------------------------------------------------------------------------
 
 
 class PolarQuantTorch:
-    """PolarQuant (Algorithm 1) — fast WHT rotation + Gaussian codebook.
+    """PolarQuant — rotation + Gaussian codebook.
 
-    Matches turboquant_plus.polar_quant.PolarQuant but runs on GPU.
+    Supports two rotation modes:
+    - 'wht' (default): D2 @ H @ D1 structured random rotation. O(d log d).
+      Original TurboQuant algorithm, full-rank decorrelation.
+    - 'planar': 2D Givens rotation per pair of elements. O(d), 4 FMAs per pair.
+      Inspired by RotorQuant/PlanarQuant. Faster, fewer parameters (128 vs 16K),
+      comparable or better PPL for KV cache.
     """
 
-    def __init__(self, dim: int, bit_width: int, seed: int = 42, device: str = "cuda"):
+    def __init__(self, dim: int, bit_width: int, seed: int = 42,
+                 device: str = "cuda", rotation: str = "wht"):
         self.dim = dim
         self.bit_width = bit_width
         self.device = device
-        self.padded_dim = _next_power_of_2(dim)
+        self.rotation_mode = rotation
 
-        # Random sign vectors for structured rotation: D1 @ H @ D2
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(device)
-        self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(device)
+
+        if rotation == "planar":
+            # Random Givens angles: one (cos, sin) pair per 2 elements
+            n_pairs = (dim + 1) // 2
+            angles = torch.rand(n_pairs, generator=gen) * 2 * math.pi
+            self.cos_sin = torch.stack([angles.cos(), angles.sin()], dim=1).float().to(device)
+            # Dummy signs for compatibility (not used in planar mode)
+            self.signs1 = torch.ones(dim, device=device)
+            self.signs2 = torch.ones(dim, device=device)
+            self.padded_dim = dim
+        else:
+            # WHT rotation: D2 @ H @ D1
+            self.padded_dim = _next_power_of_2(dim)
+            self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(device)
+            self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(device)
+            self.cos_sin = None
 
         # Codebook: optimal centroids for N(0, 1/dim)
         centroids_list = optimal_centroids(bit_width, dim)
@@ -132,31 +191,32 @@ class PolarQuantTorch:
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply fast structured rotation. x shape: (batch, dim)."""
+        """Apply forward rotation. x shape: (batch, dim)."""
+        if self.rotation_mode == "planar":
+            return _planar_rotate(x, self.cos_sin)
+
         batch = x.shape[0]
-        # Pad to power of 2
         if self.padded_dim > self.dim:
             padded = torch.zeros(batch, self.padded_dim, device=x.device, dtype=x.dtype)
             padded[:, :self.dim] = x
         else:
             padded = x.clone()
-        # D1 @ x
         padded *= self.signs1.unsqueeze(0)
-        # H @ D1 @ x
         padded = _fast_wht_batch(padded)
-        # D2 @ H @ D1 @ x
         padded *= self.signs2.unsqueeze(0)
         return padded[:, :self.dim]
 
     def _rotate_inverse(self, y: torch.Tensor) -> torch.Tensor:
-        """Inverse rotation: D1 @ H @ D2 (same as forward for orthogonal D,H)."""
+        """Apply inverse rotation."""
+        if self.rotation_mode == "planar":
+            return _planar_rotate_inverse(y, self.cos_sin)
+
         batch = y.shape[0]
         if self.padded_dim > self.dim:
             padded = torch.zeros(batch, self.padded_dim, device=y.device, dtype=y.dtype)
             padded[:, :self.dim] = y
         else:
             padded = y.clone()
-        # Reverse: D2 then H then D1
         padded *= self.signs2.unsqueeze(0)
         padded = _fast_wht_batch(padded)
         padded *= self.signs1.unsqueeze(0)
@@ -325,6 +385,7 @@ class KVCacheCompressorTorch:
         use_cuda: bool = False,
         norm_correction: bool = True,
         use_qjl: bool = False,
+        rotation: str = "wht",
     ):
         """
         Args:
@@ -334,6 +395,8 @@ class KVCacheCompressorTorch:
             use_qjl: Use QJL residual correction for K cache. Default False
                 (QJL hurts quality per TheTom's turbo4-resurrection research).
                 When False, all k_bits go to PolarQuant centroids.
+            rotation: 'wht' (Walsh-Hadamard, O(d log d)) or 'planar'
+                (2D Givens, O(d)). Planar is faster with comparable quality.
         """
         self.head_dim = head_dim
         self.k_bits = k_bits
@@ -342,22 +405,24 @@ class KVCacheCompressorTorch:
         self.use_cuda = use_cuda
         self.norm_correction = norm_correction
         self.use_qjl = use_qjl
+        self.rotation = rotation
         self._cuda_mod = None
 
-        if use_cuda:
+        if use_cuda and rotation == "wht":
+            # CUDA kernels only support WHT rotation currently
             self._init_cuda(head_dim, k_bits, v_bits, seed, device)
 
         if use_qjl and k_bits >= 2:
-            # Legacy: K = PolarQuant(k_bits-1) + QJL(1 bit)
-            self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed, device=device)
+            self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed,
+                                           device=device, rotation=rotation)
             self.k_qjl = QJLTorch(head_dim, seed=seed + 1000, device=device)
         else:
-            # Default: K = PolarQuant(k_bits), no QJL. All bits for centroids.
-            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed, device=device)
+            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed,
+                                           device=device, rotation=rotation)
             self.k_qjl = None
 
-        # V: PolarQuant MSE-only at full v_bits
-        self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500, device=device)
+        self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500,
+                                       device=device, rotation=rotation)
 
     def _init_cuda(self, head_dim, k_bits, v_bits, seed, device):
         """Initialize CUDA kernels with matching codebooks and rotations."""

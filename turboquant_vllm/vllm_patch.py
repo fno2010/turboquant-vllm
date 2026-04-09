@@ -42,6 +42,7 @@ _sink_tokens = 4  # first N positions per layer stored at FP16
 _boundary_layers = 5  # first/last N layers get higher K precision
 _total_layers = 0  # set during patching from model config
 _fp16_heads: set[int] = set()  # head indices to keep at FP16 (sink heads)
+_rotation = "wht"  # 'wht' or 'planar'
 _layer_token_counts: dict[int, int] = {}  # layer_id → tokens seen
 _layer_indices: dict[int, int] = {}  # layer_id → layer index (0-based)
 
@@ -84,6 +85,7 @@ def _get_compressor(dim: int, device: torch.device, layer_idx: int = -1) -> KVCa
             use_cuda=_use_cuda,
             norm_correction=_norm_correction,
             use_qjl=_use_qjl,
+            rotation=_rotation,
         )
         stats = _compressors[key].memory_stats()
         backend = "CUDA" if _use_cuda else "PyTorch"
@@ -267,6 +269,7 @@ def patch_vllm_attention(
     sink_tokens: int = 4,
     boundary_layers: int = 5,
     fp16_heads: set[int] | None = None,
+    rotation: str = "wht",
 ):
     """Monkey-patch vLLM attention backends for TurboQuant+ KV cache.
 
@@ -289,7 +292,7 @@ def patch_vllm_attention(
             Identify via attention entropy analysis or set empirically.
             Default None (compress all heads).
     """
-    global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers, _fp16_heads
+    global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers, _fp16_heads, _rotation
     _k_bits = k_bits
     _v_bits = v_bits
     _norm_correction = norm_correction
@@ -297,11 +300,13 @@ def patch_vllm_attention(
     _sink_tokens = sink_tokens
     _boundary_layers = boundary_layers
     _fp16_heads = fp16_heads or set()
+    _rotation = rotation
 
     # Set env vars so the vLLM plugin can re-apply in spawned subprocesses
     os.environ["TQ_KV_K_BITS"] = str(k_bits)
     os.environ["TQ_KV_V_BITS"] = str(v_bits)
     os.environ["TQ_KV_NORM_CORRECTION"] = "1" if norm_correction else "0"
+    os.environ["TQ_KV_ROTATION"] = rotation
 
     _try_cuda_init()
 
