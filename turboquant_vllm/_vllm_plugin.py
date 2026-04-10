@@ -66,11 +66,13 @@ def _register_native_backend() -> bool:
         logger.warning("Failed to register TurboQuant native backend: %s", e)
         return False
 
-    # Patch CudaPlatform.get_valid_backends to route tq* → CUSTOM
+    # Patch CudaPlatform.get_valid_backends to route tq* → CUSTOM.
+    # In vLLM this is an instance method, not classmethod, so the attribute
+    # is a regular function — no .__func__ needed.
     try:
         from vllm.platforms.cuda import CudaPlatform
 
-        _orig_get_valid = CudaPlatform.get_valid_backends.__func__
+        _orig_get_valid = CudaPlatform.get_valid_backends
 
         def _tq_get_valid_backends(self, device_capability, attn_selector_config, num_heads=None):
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)

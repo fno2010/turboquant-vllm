@@ -143,8 +143,23 @@ class TurboQuantConfig:
 
     @property
     def key_packed_size(self) -> int:
-        """Packed bytes for one compressed KEY vector."""
-        mse_bytes = math.ceil(self.head_dim * self.mse_bits / 8)
+        """Packed bytes for one compressed KEY vector.
+
+        Packing scheme (must match native_backend._store_kv/_decode_attention_python):
+          4-bit: nibble pack → head_dim // 2 bytes  (2 indices per byte, 4 bits each)
+          3-bit: nibble pack → head_dim // 2 bytes  (waste 1 bit per nibble, avoids cross-byte)
+          2-bit: 4-per-byte → head_dim // 4 bytes
+          other: tight bit pack → ceil(head_dim * mse_bits / 8)
+        """
+        d = self.head_dim
+        b = self.mse_bits
+        if b in (3, 4) and d % 2 == 0:
+            mse_bytes = d // 2   # nibble packing
+        elif b == 2 and d % 4 == 0:
+            mse_bytes = d // 4   # 2-per-byte
+        else:
+            mse_bytes = math.ceil(d * b / 8)  # tight, cross-byte
+
         if self.no_qjl:
             return mse_bytes + 2  # indices + vec_norm
         qjl_bytes = math.ceil(self.head_dim / 8)

@@ -436,7 +436,14 @@ class TurboQuantAttentionImpl:
 
         mse_bits = self.tq_config.mse_bits
         kps = self.tq_config.key_packed_size
-        mse_bytes_n = math.ceil(D * mse_bits / 8)
+        # mse_bytes_n must match the packing branch taken below.
+        # 3/4-bit nibble: D//2, 2-bit: D//4, else: ceil.
+        if mse_bits in (3, 4) and D % 2 == 0:
+            mse_bytes_n = D // 2
+        elif mse_bits == 2 and D % 4 == 0:
+            mse_bytes_n = D // 4
+        else:
+            mse_bytes_n = math.ceil(D * mse_bits / 8)
         qjl_bytes_n = math.ceil(D / 8)
         block_size = kv_cache.shape[1]
         device = key.device
@@ -460,11 +467,13 @@ class TurboQuantAttentionImpl:
             projected = r_rot @ Pi_S_T
             signs = (projected >= 0).to(torch.uint8)
 
-        # Pack MSE indices
-        if mse_bits == 4 and D % 2 == 0:
-            idx_r = idx.reshape(-1, D // 2, 2)
-            packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
-        elif mse_bits == 3 and D % 2 == 0:
+        # Pack MSE indices.
+        # 4-bit: nibble pack (D//2 bytes)
+        # 3-bit: also nibble pack — indices are 0..7, still fit in 4 bits;
+        #        wastes 1 bit per index but avoids cross-byte reads on decode
+        # 2-bit: 4-per-byte (D//4 bytes)
+        # other: tight byte-spanning pack (ceil(D*mse_bits/8) bytes)
+        if mse_bits in (3, 4) and D % 2 == 0:
             idx_r = idx.reshape(-1, D // 2, 2)
             packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
         elif mse_bits == 2 and D % 4 == 0:
@@ -629,7 +638,13 @@ class TurboQuantAttentionImpl:
         Hk = self.num_kv_heads
         kps = self.tq_config.key_packed_size
         mse_bits = self.tq_config.mse_bits
-        mse_bytes_n = math.ceil(D * mse_bits / 8)
+        # Must match store path: 3/4-bit nibble, 2-bit 4-per-byte, else tight.
+        if mse_bits in (3, 4) and D % 2 == 0:
+            mse_bytes_n = D // 2
+        elif mse_bits == 2 and D % 4 == 0:
+            mse_bytes_n = D // 4
+        else:
+            mse_bytes_n = math.ceil(D * mse_bits / 8)
         no_qjl = self.tq_config.no_qjl
         block_size = kv_cache.shape[1]
         device = query.device
@@ -648,6 +663,8 @@ class TurboQuantAttentionImpl:
             mse_sh: Optional[torch.Tensor] = torch.tensor([0, 2, 4, 6], device=device, dtype=torch.int32)
             mse_mask = 0x3
         elif mse_bits in (3, 4):
+            # Nibble packing: 2 indices per byte. For 3-bit, the high bit of
+            # each nibble is unused (values 0..7 fit in lower 3 bits).
             mse_sh = torch.tensor([0, 4], device=device, dtype=torch.int32)
             mse_mask = 0xF
         else:
@@ -671,6 +688,7 @@ class TurboQuantAttentionImpl:
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
             elif mse_bits in (3, 4) and D % 2 == 0:
+                # Nibble unpack matches nibble store path for both 3- and 4-bit
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
             else:
