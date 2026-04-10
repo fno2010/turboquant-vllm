@@ -526,7 +526,7 @@ class TurboQuantAttentionImpl:
             v_flat = value.reshape(-1, D)
             packed_value = v_flat.to(torch.float8_e4m3fn).view(torch.uint8)
         else:
-            vqb = self.tq_config.value_quant_bits
+            vqb = self.tq_config.effective_value_quant_bits
             val_data_bytes = math.ceil(D * vqb / 8)
             qmax = (1 << vqb) - 1
             v_flat = value.float().reshape(-1, D)
@@ -782,7 +782,7 @@ class TurboQuantAttentionImpl:
                 val_raw = slots[:, :, kps:kps + D]
                 values = val_raw.view(torch.float8_e4m3fn).float()
             else:
-                vqb = self.tq_config.value_quant_bits
+                vqb = self.tq_config.effective_value_quant_bits
                 val_data_bytes = math.ceil(D * vqb / 8)
                 qmax = (1 << vqb) - 1
                 val_raw = slots[:, :, kps:kps + val_data_bytes]

@@ -162,6 +162,14 @@ class TurboQuantConfig:
 
     @property
     def effective_value_quant_bits(self) -> int:
+        """Bits used to store each V coordinate.
+
+        Asymmetric mode (e.g. tq_k4v3) uses v_total_bits for V instead of
+        value_quant_bits, which otherwise defaults to 8 (FP8). This makes
+        --kv-cache-dtype tq_k4v3 actually deliver 3-bit V storage.
+        """
+        if self.asymmetric:
+            return self.v_total_bits
         return self.value_quant_bits
 
     @property
@@ -173,7 +181,7 @@ class TurboQuantConfig:
         """Packed bytes for one VALUE vector."""
         if self.value_fp8:
             return self.head_dim
-        data_bytes = math.ceil(self.head_dim * self.value_quant_bits / 8)
+        data_bytes = math.ceil(self.head_dim * self.effective_value_quant_bits / 8)
         return data_bytes + 4  # +2 scale(fp16) +2 zero(fp16)
 
     @property

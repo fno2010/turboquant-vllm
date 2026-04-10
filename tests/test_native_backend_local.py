@@ -62,10 +62,30 @@ class TestTurboQuantConfig(unittest.TestCase):
 
     def test_tq_k4v3(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
-        c = TurboQuantConfig.from_cache_dtype("tq_k4v3", head_dim=64)
+        c = TurboQuantConfig.from_cache_dtype("tq_k4v3", head_dim=128)
         self.assertTrue(c.asymmetric)
         self.assertEqual(c.total_bits, 4)
         self.assertEqual(c.v_total_bits, 3)
+        # Regression: effective_value_quant_bits must honor asymmetric,
+        # not return the default value_quant_bits=8. Otherwise tq_k4v3
+        # silently stores V as FP8 and is identical to tq4.
+        self.assertEqual(c.effective_value_quant_bits, 3)
+        self.assertFalse(c.value_fp8)
+        # 3-bit V storage: ceil(128 * 3 / 8) = 48 bytes + 4 for fp16 scale/zero
+        self.assertEqual(c.value_packed_size, 52)
+
+    def test_tq_k4v3_vs_tq4_differ(self):
+        """tq_k4v3 and tq4 must produce different slot sizes (regression)."""
+        from turboquant_vllm.tq_config import TurboQuantConfig
+        tq4 = TurboQuantConfig.from_cache_dtype("tq4", head_dim=128)
+        tq_k4v3 = TurboQuantConfig.from_cache_dtype("tq_k4v3", head_dim=128)
+        self.assertNotEqual(
+            tq4.slot_size, tq_k4v3.slot_size,
+            "tq_k4v3 must use 3-bit V storage; if this fails the asymmetric "
+            "path is broken and tq_k4v3 is silently aliased to tq4.",
+        )
+        # tq_k4v3 should be smaller than tq4 (3-bit V vs FP8 V)
+        self.assertLess(tq_k4v3.slot_size, tq4.slot_size)
 
     def test_unknown_raises(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
