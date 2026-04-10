@@ -708,15 +708,14 @@ class TurboQuantAttentionImpl:
                 bo = j * mse_bits
                 bi = (bo // 8).long()
                 si = (bo % 8).int()
-                b0 = mse_raw[:, :, bi].int()
+                mse_raw_padded = F.pad(mse_raw, (0, 1))
+                b0 = mse_raw_padded[:, :, bi].int()
                 val = (b0 >> si) & ((1 << mse_bits) - 1)
                 need_next = si + mse_bits > 8
-                if need_next.any():
-                    bi_next = (bi + 1).clamp(max=mse_raw.shape[-1] - 1)
-                    b1 = mse_raw[:, :, bi_next].int()
-                    high = (b1 << (8 - si)) & ((1 << mse_bits) - 1)
-                    val = torch.where(need_next, val | high, val)
-                idx = val
+                bi_next = bi + 1
+                b1 = mse_raw_padded[:, :, bi_next].int()
+                high = (b1 << (8 - si)) & ((1 << mse_bits) - 1)
+                idx = torch.where(need_next, val | high, val)
 
             c_vals = centroids[idx.long()]
 
