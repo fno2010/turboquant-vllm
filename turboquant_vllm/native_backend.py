@@ -532,13 +532,14 @@ class TurboQuantAttentionImpl:
         packed_key = packed_key.reshape(N, H, kps)
         packed_value = packed_value.reshape(N, H, vps)
         valid = slot_mapping >= 0
-        if not valid.any():
-            return
-        packed_key = packed_key[valid]
-        packed_value = packed_value[valid]
-        valid_slots = slot_mapping[valid]
-        blk_idx = (valid_slots // block_size).long()
-        blk_off = (valid_slots % block_size).long()
+        safe_slots = torch.where(valid, slot_mapping, torch.zeros_like(slot_mapping))
+        blk_idx = (safe_slots // block_size).long()
+        blk_off = (safe_slots % block_size).long()
+        existing_key = kv_cache[blk_idx, blk_off, :, :kps]
+        existing_value = kv_cache[blk_idx, blk_off, :, kps:kps + vps]
+        valid_mask = valid.view(N, 1, 1)
+        packed_key = torch.where(valid_mask, packed_key, existing_key)
+        packed_value = torch.where(valid_mask, packed_value, existing_value)
         kv_cache[blk_idx, blk_off, :, :kps] = packed_key
         kv_cache[blk_idx, blk_off, :, kps:kps + vps] = packed_value
 
