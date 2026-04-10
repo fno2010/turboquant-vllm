@@ -37,7 +37,7 @@ def test_store_kv_uses_true_3bit_layout_for_representative_dims():
             num_kv_heads=1,
             kv_cache_dtype="tq3",
         )
-        impl.tq_config = TurboQuantConfig(head_dim=d, total_bits=3, value_quant_bits=8, no_qjl=True)
+        impl.tq_config = TurboQuantConfig(head_dim=d, total_bits=3, value_quant_bits=4, no_qjl=True)
 
         centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 3)
 
@@ -117,7 +117,7 @@ def test_decode_roundtrip_3bit_mse():
             kv_cache_dtype="tq3",
         )
         impl.tq_config = TurboQuantConfig(
-            head_dim=d, total_bits=3, value_quant_bits=8, no_qjl=True,
+            head_dim=d, total_bits=3, value_quant_bits=4, no_qjl=True,
         )
 
         centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 3)
