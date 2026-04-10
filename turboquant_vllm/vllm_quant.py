@@ -14,7 +14,7 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Iterable, Union
 
 import torch
 from torch import nn
@@ -116,6 +116,16 @@ def register():
                 # Determine bits for this layer
                 layer_bits = select_bits(prefix, self.bits, self.sensitive_bits)
                 return TurboQuantLinearMethod(self, layer_bits)
+            # Check for FusedMoE (MoE layers like GLM-5.1's 256-expert MoE)
+            try:
+                from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+            except ImportError:
+                return None
+            if isinstance(layer, FusedMoE):
+                # Get the FusedMoEConfig from the layer's quant_method
+                # (created during FusedMoE.__init__)
+                moe_config = layer.moe_config
+                return TurboQuantMoEMethod(self, self.bits, moe_config)
             return None
 
     class TurboQuantLinearMethod(LinearMethodBase):
@@ -249,6 +259,288 @@ def register():
             if bias is not None:
                 output = output + bias
             return output
+
+    # ------------------------------------------------------------------
+    # TurboQuantMoEMethod: TQ3/TQ4 weight compression for FusedMoE layers.
+    # GLM-5.1 MoE uses independent gate/up/down projections (NOT fused w13),
+    # and the computation is: h = gate(x) * silu(up(x)) (element-wise), then h @ down(x).
+    # This is semantically incompatible with vLLM's fused_experts kernel.
+    # We decompress only top-k experts (8 out of 256) to avoid OOM.
+    # ------------------------------------------------------------------
+
+    # Import FusedMoE base classes needed for TurboQuantMoEMethod
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    from vllm.model_executor.layers.fused_moe.config import (
+        FUSED_MOE_UNQUANTIZED_CONFIG,
+    )
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+    class TurboQuantMoEMethod(FusedMoEMethodBase):
+        """MoE quantization method that decompresses only top-k experts.
+
+        GLM-5.1 has 256 routed experts with 8 active per token. Decompressing
+        all 256 experts in BF16 would require ~17 GB just for weights.
+        Instead, we keep all 256 experts in TQ3/TQ4 packed format (~1.5 GB)
+        and decompress only the 8 active experts per forward pass.
+        """
+
+        def __init__(self, quant_config: "TurboQuantConfig", bits: int,
+                     moe: "FusedMoEConfig"):  # FusedMoEConfig from vLLM
+            super().__init__(moe)
+            self.quant_config = quant_config
+            self.bits = bits
+            self.group_size = quant_config.group_size
+
+        def get_fused_moe_quant_config(self, layer) -> "FusedMoEQuantConfig":
+            # Return UNQUANTIZED so vLLM's modular kernel system doesn't try
+            # to dequantize our already-compressed weights. We handle
+            # decompression ourselves in apply().
+            return FUSED_MOE_UNQUANTIZED_CONFIG
+
+        def create_weights(self, layer, num_experts: int, hidden_size: int,
+                           intermediate_size_per_partition: int,
+                           params_dtype: torch.dtype, **extra_weight_attrs):
+            """Register gate_packed, up_packed, down_packed as uint8 packed params.
+
+            GLM checkpoint: experts.{E}.gate_proj/up_proj/down_proj.weight.tq_packed
+            We store each as (num_experts, dim, hidden_size) packed uint8.
+            """
+            weight_loader = extra_weight_attrs.get("weight_loader")
+            assert weight_loader is not None, "weight_loader required"
+
+            # Compute packed dimensions for each projection
+            # Each proj: (intermediate_size, hidden_size) → TQ packed uint8
+            for proj_name, dim_size in [
+                ("gate_packed", intermediate_size_per_partition),
+                ("up_packed", intermediate_size_per_partition),
+                ("down_packed", hidden_size),
+            ]:
+                padded_in = ((dim_size + self.group_size - 1) // self.group_size) * self.group_size
+                n_groups = padded_in // self.group_size
+                if self.bits == 3:
+                    packed_cols = n_groups * (self.group_size * 3 // 8)
+                elif self.bits == 4:
+                    packed_cols = n_groups * (self.group_size // 2)
+                else:
+                    packed_cols = n_groups * self.group_size
+
+                from fractions import Fraction
+                pack_ratio = Fraction(padded_in, packed_cols)
+
+                packed_param = PackedvLLMParameter(
+                    data=torch.empty(
+                        num_experts * dim_size,
+                        packed_cols,
+                        dtype=torch.uint8,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    packed_dim=1,
+                    packed_factor=pack_ratio,
+                    weight_loader=weight_loader,
+                )
+
+                # Norms: (num_experts * dim_size, n_groups) float32
+                norms_param = PackedvLLMParameter(
+                    data=torch.empty(
+                        num_experts * dim_size,
+                        n_groups,
+                        dtype=torch.float32,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    packed_dim=1,
+                    packed_factor=self.group_size,
+                    weight_loader=weight_loader,
+                )
+
+                layer.register_parameter(proj_name, packed_param)
+                layer.register_parameter(f"{proj_name}_norms", norms_param)
+
+            layer._tq_moe_bits = self.bits
+            layer._tq_moe_group_size = self.group_size
+            layer._tq_moe_intermediate = intermediate_size_per_partition
+            layer._tq_moe_hidden = hidden_size
+            layer._tq_moe_num_experts = num_experts
+
+        def _decompress_topk_experts(self, layer, topk_ids: torch.Tensor,
+                                      x: torch.Tensor):
+            """Decompress only the topk_ids experts from packed format.
+
+            Returns (gate_deq, up_deq, down_deq) each of shape (num_topk, dim, hidden).
+            """
+            bits = layer._tq_moe_bits
+            group_size = layer._tq_moe_group_size
+            inter_size = layer._tq_moe_intermediate
+            hidden_size = layer._tq_moe_hidden
+
+            unique_ids = topk_ids.unique().tolist()
+            num_topk = len(unique_ids)
+
+            device = x.device
+            quantizer = _get_quantizer(group_size, bits, str(device))
+
+            # Decompress gate, up, down for the unique experts in topk_ids
+            results = {}
+            for proj_name, dim_size in [
+                ("gate_packed", inter_size),
+                ("up_packed", inter_size),
+                ("down_packed", hidden_size),
+            ]:
+                packed = getattr(layer, proj_name).data
+                norms = getattr(layer, f"{proj_name}_norms").data
+
+                # Extract rows for the topk experts
+                # Each expert occupies dim_size rows
+                indices = torch.tensor(
+                    [eid * dim_size for eid in unique_ids],
+                    dtype=torch.long, device=device
+                )
+                # Expand to all rows of each expert
+                idx_expanded = indices.unsqueeze(1).repeat(1, dim_size).flatten()
+                offset = torch.arange(dim_size, device=device).unsqueeze(0) * num_topk
+                row_idx = (idx_expanded.unsqueeze(1) + offset).flatten()
+
+                proj_packed = packed[row_idx]  # (num_topk * dim_size, packed_cols)
+                proj_norms = norms[row_idx]    # (num_topk * dim_size, n_groups)
+
+                # Decompress
+                padded_in = ((dim_size + group_size - 1) // group_size) * group_size
+                indices_unpacked = unpack_indices(proj_packed, bits, group_size)
+                n_groups = padded_in // group_size
+                proj_groups = quantizer.dequantize(
+                    indices_unpacked, proj_norms.reshape(-1)
+                )  # (num_topk * dim_size * n_groups,)
+
+                proj_deq = proj_groups.reshape(num_topk * dim_size, padded_in)[:, :dim_size]
+                results[proj_name] = proj_deq.reshape(num_topk, dim_size, dim_size).to(x.dtype)
+
+            return results["gate_packed"], results["up_packed"], results["down_packed"]
+
+        def apply(self, layer, x: torch.Tensor, topk_weights: torch.Tensor,
+                  topk_ids: torch.Tensor,
+                  shared_experts_input: torch.Tensor | None) -> torch.Tensor:
+            """GLM-5.1 MoE computation: gate * silu(up) element-wise, then @ down.
+
+            Only decompresses the experts in topk_ids (typically 8 out of 256).
+            topk_ids: (total_tokens, num_topk) expert indices
+            topk_weights: (total_tokens, num_topk) weights for each expert
+            """
+            # Decompress only the unique experts present in this batch
+            gate_w, up_w, down_w = self._decompress_topk_experts(layer, topk_ids, x)
+            num_topk = gate_w.shape[0]
+            # unique_ids[k] = expert ID for the k-th decompressed expert (sorted)
+            unique_ids = topk_ids.unique().tolist()
+            # Build lookup: expert_id → index in decompressed weights
+            eid_to_idx = {eid: k for k, eid in enumerate(unique_ids)}
+
+            # x: (seq_len, batch, hidden) or (batch, hidden)
+            orig_shape = x.shape
+            if x.dim() == 3:
+                x = x.transpose(0, 1).reshape(-1, x.shape[-1])
+            elif x.dim() == 2:
+                x = x.reshape(-1, x.shape[-1])
+            # x: (total_tokens, hidden_size)
+
+            total_tokens = x.shape[0]
+            output = torch.zeros_like(x)
+
+            # Iterate: for each token i and each topk slot k,
+            # look up the expert for that slot and compute its contribution
+            for i in range(total_tokens):
+                for k in range(num_topk):
+                    eid = topk_ids[i, k].item()
+                    w = topk_weights[i, k]
+                    if w == 0:
+                        continue
+                    idx = eid_to_idx[eid]
+                    gate = gate_w[idx]
+                    up = up_w[idx]
+                    down = down_w[idx]
+                    # GLM: h = gate * silu(up) element-wise, then @ down
+                    h_gate = torch.matmul(x[i], gate.t())  # (intermediate,)
+                    h_up = torch.matmul(x[i], up.t())       # (intermediate,)
+                    h_up_act = h_up * torch.sigmoid(h_up)
+                    h = h_gate * h_up_act
+                    out = torch.matmul(h, down.t()) * w
+                    output[i] += out
+
+            # Restore original shape
+            if len(orig_shape) == 3:
+                output = output.reshape(orig_shape[1], orig_shape[0], -1).transpose(0, 1)
+            elif len(orig_shape) == 2:
+                output = output.reshape(orig_shape)
+
+            return output
+
+        def load_weights(self, layer, weights) -> Iterable[str]:
+            """Custom weight loading for GLM MoE checkpoints.
+
+            GLM has: experts.{E}.gate_proj.weight.tq_packed (per expert, 2D).
+            We map these to our gate_packed/up_packed/down_packed params.
+            """
+            num_experts = layer._tq_moe_num_experts
+            hidden_size = layer._tq_moe_hidden
+            inter_size = layer._tq_moe_intermediate
+
+            # Build mapping: checkpoint name → (param_name, expert_id)
+            # GLM: experts.{E}.gate_proj → experts.gate_packed[E * inter_size : (E+1) * inter_size]
+            #      experts.{E}.up_proj → experts.up_packed[E * inter_size : ...]
+            #      experts.{E}.down_proj → experts.down_packed[E * hidden_size : ...]
+            expert_params_mapping = []
+            for expert_id in range(num_experts):
+                expert_prefix = f"experts.{expert_id}."
+                for proj_name, dim_size in [
+                    ("gate_proj", inter_size),
+                    ("up_proj", inter_size),
+                    ("down_proj", hidden_size),
+                ]:
+                    weight_name = f"{expert_prefix}{proj_name}.weight"
+                    # Map to our param: gate_packed, up_packed, or down_packed
+                    if proj_name == "gate_proj":
+                        param_base = "gate_packed"
+                    elif proj_name == "up_proj":
+                        param_base = "up_packed"
+                    else:
+                        param_base = "down_packed"
+                    expert_params_mapping.append((param_base, weight_name, expert_id))
+
+            for expert_name, loaded_weight in weights:
+                for param_name, weight_name, expert_id in expert_params_mapping:
+                    if weight_name not in expert_name:
+                        continue
+                    # weight_name found in expert_name — load it
+                    param = getattr(layer, param_name)
+                    dim_size = inter_size if "gate" in param_name or "up" in param_name else hidden_size
+
+                    # loaded_weight: (dim_size, hidden_size) TQ packed
+                    # Store at row offset: expert_id * dim_size
+                    start_row = expert_id * dim_size
+                    end_row = start_row + dim_size
+
+                    if loaded_weight.dim() == 2:
+                        param.data[start_row:end_row] = loaded_weight.contiguous()
+                    else:
+                        # Should not happen for GLM (experts are 2D)
+                        param.data[start_row:end_row] = loaded_weight.squeeze(0).contiguous()
+
+                    yield expert_name
+
+    # ------------------------------------------------------------------
+    # Patch FusedMoE.load_weights to delegate to quant_method's loader
+    # when it's a TurboQuantMoEMethod.
+    # ------------------------------------------------------------------
+    _original_fused_moe_load_weights = FusedMoE.load_weights
+
+    def _tq_fused_moe_load_weights(self, weights):
+        if isinstance(self.quant_method, TurboQuantMoEMethod):
+            # Use our custom loader that understands GLM TQ checkpoint format
+            return self.quant_method.load_weights(self, weights)
+        return _original_fused_moe_load_weights(self, weights)
+
+    FusedMoE.load_weights = _tq_fused_moe_load_weights
 
     # Patch the weight loader to remap old-style checkpoint names
     # Old: model.layers.0.self_attn.q_proj.weight.tq_packed
