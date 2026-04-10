@@ -804,7 +804,10 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
             bits, group_size, expert_bits_msg, replacements, expert_layers,
             total_original / 1e9, total_compressed / 1e9, ratio, prune_msg,
         )
-        torch.cuda.empty_cache()
+        # Guard: on CPU-only PyTorch builds (Mac, CI, etc.) calling
+        # torch.cuda.empty_cache() raises AssertionError.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return total
 
