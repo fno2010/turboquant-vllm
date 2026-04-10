@@ -31,6 +31,7 @@ from typing import ClassVar, Optional
 
 import torch
 import torch.nn.functional as F
+from turboquant_vllm.tq_config import TurboQuantConfig
 
 _USE_STREAM_OVERLAP = os.environ.get("TQ_STREAM_OVERLAP", "0") == "1"
 _TQ_NO_QJL = os.environ.get("TQ_NO_QJL", "1") == "1"
@@ -89,8 +90,6 @@ try:
 except ImportError:
     import logging
     logger = logging.getLogger(__name__)
-
-from turboquant_vllm.tq_config import TurboQuantConfig
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +732,6 @@ class TurboQuantAttentionImpl:
 
             attn_w = torch.softmax(scores.T, dim=-1)  # (Hq, S)
 
-            vps = self.tq_config.value_packed_size
             if self.tq_config.value_fp8:
                 val_raw = slots[:, :, kps:kps + D]
                 values = val_raw.view(torch.float8_e4m3fn).float()
