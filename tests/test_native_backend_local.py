@@ -11,7 +11,6 @@ Tests:
 
 import math
 import sys
-import traceback
 import unittest
 import unittest.mock as mock
 
@@ -232,13 +231,12 @@ class TestStoreDecodeCPU(unittest.TestCase):
     def test_tq3_mse_reasonable(self):
         """TQ3 MSE on random normalized vectors should be < 0.15."""
         from turboquant_vllm.tq_config import get_centroids
-        from turboquant_vllm.tq_config import TurboQuantConfig
-        import math as _math
 
         cfg = self.cfg
         D, H = self.D, self.H
         N = 32
         key = torch.randn(N, H, D)
+        value = torch.randn(N, H, D)
         kps = cfg.key_packed_size
         vps = cfg.value_packed_size
         slot_size = kps + vps
@@ -246,8 +244,7 @@ class TestStoreDecodeCPU(unittest.TestCase):
         slot_mapping = torch.arange(N)
 
         impl = self._make_impl()
-        impl._store_kv(key, value := torch.randn(N, H, D),
-                       kv_cache, slot_mapping,
+        impl._store_kv(key, value, kv_cache, slot_mapping,
                        self.layer._tq_Pi, self.layer._tq_S, self.layer._tq_centroids)
 
         # Manually decode one token to check quality

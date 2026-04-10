@@ -437,17 +437,7 @@ class TurboQuantAttentionImpl:
 
         mse_bits = self.tq_config.mse_bits
         kps = self.tq_config.key_packed_size
-        # mse_bytes_n must match the packing branch taken below.
-        # 4-bit nibble: D//2, 3-bit tight (8→3 bytes): 3*D//8 when D%8==0,
-        # 2-bit: D//4, else tight bit-packing: ceil(D*mse_bits/8).
-        if mse_bits == 4 and D % 2 == 0:
-            mse_bytes_n = D // 2
-        elif mse_bits == 3 and D % 8 == 0:
-            mse_bytes_n = 3 * D // 8
-        elif mse_bits == 2 and D % 4 == 0:
-            mse_bytes_n = D // 4
-        else:
-            mse_bytes_n = math.ceil(D * mse_bits / 8)
+        mse_bytes_n = math.ceil(D * mse_bits / 8)
         qjl_bytes_n = math.ceil(D / 8)
         block_size = kv_cache.shape[1]
         device = key.device
@@ -667,16 +657,7 @@ class TurboQuantAttentionImpl:
         Hk = self.num_kv_heads
         kps = self.tq_config.key_packed_size
         mse_bits = self.tq_config.mse_bits
-        # Must match store path: 4-bit nibble (D/2), 3-bit tight (3D/8),
-        # 2-bit 4-per-byte (D/4), else generic ceil(D*b/8).
-        if mse_bits == 4 and D % 2 == 0:
-            mse_bytes_n = D // 2
-        elif mse_bits == 3 and D % 8 == 0:
-            mse_bytes_n = 3 * D // 8
-        elif mse_bits == 2 and D % 4 == 0:
-            mse_bytes_n = D // 4
-        else:
-            mse_bytes_n = math.ceil(D * mse_bits / 8)
+        mse_bytes_n = math.ceil(D * mse_bits / 8)
         no_qjl = self.tq_config.no_qjl
         block_size = kv_cache.shape[1]
         device = query.device
