@@ -468,20 +468,20 @@ class TurboQuantAttentionImpl:
             idx_r = idx.reshape(-1, D // 8, 8).int()
             packed_mse = torch.empty(N * H, D // 8 * 3, dtype=torch.uint8, device=device)
             packed_mse[:, 0::3] = (
-                idx_r[:, :, 0]
-                | (idx_r[:, :, 1] << 3)
-                | (idx_r[:, :, 2] << 6)
+                (idx_r[:, :, 0] & 0x7)
+                | ((idx_r[:, :, 1] & 0x7) << 3)
+                | ((idx_r[:, :, 2] & 0x3) << 6)
             ).to(torch.uint8)
             packed_mse[:, 1::3] = (
-                (idx_r[:, :, 2] >> 2)
-                | (idx_r[:, :, 3] << 1)
-                | (idx_r[:, :, 4] << 4)
-                | (idx_r[:, :, 5] << 7)
+                ((idx_r[:, :, 2] >> 2) & 0x1)
+                | ((idx_r[:, :, 3] & 0x7) << 1)
+                | ((idx_r[:, :, 4] & 0x7) << 4)
+                | ((idx_r[:, :, 5] & 0x1) << 7)
             ).to(torch.uint8)
             packed_mse[:, 2::3] = (
-                (idx_r[:, :, 5] >> 1)
-                | (idx_r[:, :, 6] << 2)
-                | (idx_r[:, :, 7] << 5)
+                ((idx_r[:, :, 5] >> 1) & 0x3)
+                | ((idx_r[:, :, 6] & 0x7) << 2)
+                | ((idx_r[:, :, 7] & 0x7) << 5)
             ).to(torch.uint8)
         elif mse_bits == 2 and D % 4 == 0:
             idx_r = idx.reshape(-1, D // 4, 4)
