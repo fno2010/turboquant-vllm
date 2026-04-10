@@ -74,12 +74,13 @@ def _register_native_backend() -> bool:
 
         _orig_get_valid = CudaPlatform.get_valid_backends
 
-        def _tq_get_valid_backends(self, device_capability, attn_selector_config, num_heads=None):
+        @staticmethod
+        def _tq_get_valid_backends(device_capability, attn_selector_config, num_heads=None):
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
             if kv_cache_dtype is not None and str(kv_cache_dtype).startswith("tq"):
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
                 return [(AttentionBackendEnum.CUSTOM, 0)], {}
-            return _orig_get_valid(self, device_capability, attn_selector_config, num_heads)
+            return _orig_get_valid(device_capability, attn_selector_config, num_heads)
 
         CudaPlatform.get_valid_backends = _tq_get_valid_backends
         logger.debug("TurboQuant patched CudaPlatform.get_valid_backends")
