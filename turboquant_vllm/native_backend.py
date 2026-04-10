@@ -31,6 +31,7 @@ from typing import ClassVar, Optional
 
 import torch
 import torch.nn.functional as F
+from turboquant_vllm.tq_config import TurboQuantConfig
 
 _USE_STREAM_OVERLAP = os.environ.get("TQ_STREAM_OVERLAP", "0") == "1"
 _TQ_NO_QJL = os.environ.get("TQ_NO_QJL", "1") == "1"
@@ -89,8 +90,6 @@ try:
 except ImportError:
     import logging
     logger = logging.getLogger(__name__)
-
-from turboquant_vllm.tq_config import TurboQuantConfig
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +540,15 @@ class TurboQuantAttentionImpl:
         # Scatter to cache
         packed_key = packed_key.reshape(N, H, kps)
         packed_value = packed_value.reshape(N, H, vps)
-        safe_slot = slot_mapping.clamp(min=0)
-        blk_idx = (safe_slot // block_size).long()
-        blk_off = (safe_slot % block_size).long()
+        valid = slot_mapping >= 0
+        safe_slots = torch.where(valid, slot_mapping, torch.zeros_like(slot_mapping))
+        blk_idx = (safe_slots // block_size).long()
+        blk_off = (safe_slots % block_size).long()
+        existing_key = kv_cache[blk_idx, blk_off, :, :kps]
+        existing_value = kv_cache[blk_idx, blk_off, :, kps:kps + vps]
+        valid_mask = valid.view(N, 1, 1)
+        packed_key = torch.where(valid_mask, packed_key, existing_key)
+        packed_value = torch.where(valid_mask, packed_value, existing_value)
         kv_cache[blk_idx, blk_off, :, :kps] = packed_key
         kv_cache[blk_idx, blk_off, :, kps:kps + vps] = packed_value
 
@@ -746,7 +751,6 @@ class TurboQuantAttentionImpl:
 
             attn_w = torch.softmax(scores.T, dim=-1)  # (Hq, S)
 
-            vps = self.tq_config.value_packed_size
             if self.tq_config.value_fp8:
                 val_raw = slots[:, :, kps:kps + D]
                 values = val_raw.view(torch.float8_e4m3fn).float()
