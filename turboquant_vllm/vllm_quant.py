@@ -302,22 +302,24 @@ def register():
         def create_weights(self, layer, num_experts: int, hidden_size: int,
                            intermediate_size_per_partition: int,
                            params_dtype: torch.dtype, **extra_weight_attrs):
-            """Register gate/up/down TQ packed params as plain tensors.
+            """Register w13 (gate+up fused) and w2 (down) TQ packed params.
 
-            GLM checkpoint: experts.{E}.gate_proj/up_proj/down_proj.weight.tq_packed
-            We store each as (num_experts, dim, hidden_size) packed uint8.
+            expert_params_mapping (from SharedFusedMoE.make_expert_params_mapping)
+            expects params named w13_weight and w2_weight so that the standard
+            vLLM weight loading path (deepseek_v2.load_weights →
+            expert_params_mapping → param.weight_loader) finds them.
+
+            GLM checkpoint stores separate gate_proj/up_proj/down_proj per expert.
+            We concatenate gate+up into w13 and keep down as w2.
             No TP sharding — expert parallelism handles distribution.
 
             We register as plain torch.nn.Parameter (NOT PackedvLLMParameter)
             to avoid LinearMethod.weight_loader trying to apply TP sharding.
-            Weight loading is fully controlled by TurboQuantMoEMethod.load_weights.
             """
-            # Compute packed dimensions for each projection
-            for proj_name, dim_size in [
-                ("gate_proj", intermediate_size_per_partition),
-                ("up_proj", intermediate_size_per_partition),
-                ("down_proj", hidden_size),
-            ]:
+            inter_size = intermediate_size_per_partition
+
+            # Helper to compute packed dimensions
+            def _packed_dims(dim_size):
                 padded_in = ((dim_size + self.group_size - 1) // self.group_size) * self.group_size
                 n_groups = padded_in // self.group_size
                 if self.bits == 3:
@@ -326,39 +328,65 @@ def register():
                     packed_cols = n_groups * (self.group_size // 2)
                 else:
                     packed_cols = n_groups * self.group_size
+                return packed_cols, n_groups, padded_in
 
-                # Register as plain uint8 param — NO TP sharding, NO weight_loader
-                # We handle all loading in TurboQuantMoEMethod.load_weights
-                packed_param = torch.nn.Parameter(
-                    torch.empty(
-                        num_experts * dim_size,
-                        packed_cols,
-                        dtype=torch.uint8,
-                    ),
-                    requires_grad=False,
-                )
-                layer.register_parameter(f"{proj_name}_packed", packed_param)
+            # w13 = [gate; up] — stored as (num_experts * 2 * inter, packed_w13)
+            packed_w13, n_groups_w13, padded_in_w13 = _packed_dims(inter_size)
+            w13_rows = num_experts * 2 * inter_size
 
-                # Norms: (num_experts * dim_size, n_groups) float32
-                norms_param = torch.nn.Parameter(
-                    torch.empty(
-                        num_experts * dim_size,
-                        n_groups,
-                        dtype=torch.float32,
-                    ),
-                    requires_grad=False,
-                )
-                layer.register_parameter(f"{proj_name}_norms", norms_param)
+            # Register params and attach weight_loader method + layer reference.
+            # vLLM's deepseek_v2.load_weights calls param.weight_loader(...) for
+            # each (pth_path, param_name, expert_id, shard_id) in
+            # expert_params_mapping. We need weight_loader attached to each param.
+            w13_weight = torch.nn.Parameter(
+                torch.empty(w13_rows, packed_w13, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight", w13_weight)
+            w13_weight.weight_loader = self.weight_loader
+            w13_weight._tq_layer = layer
+
+            w13_norms = torch.nn.Parameter(
+                torch.empty(w13_rows, n_groups_w13, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_norms", w13_norms)
+            w13_norms.weight_loader = self.weight_loader
+            w13_norms._tq_layer = layer
+
+            # w2 = down — stored as (num_experts * inter, packed_w2)
+            packed_w2, n_groups_w2, padded_in_w2 = _packed_dims(hidden_size)
+            w2_rows = num_experts * inter_size
+
+            w2_weight = torch.nn.Parameter(
+                torch.empty(w2_rows, packed_w2, dtype=torch.uint8),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight", w2_weight)
+            w2_weight.weight_loader = self.weight_loader
+            w2_weight._tq_layer = layer
+
+            w2_norms = torch.nn.Parameter(
+                torch.empty(w2_rows, n_groups_w2, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_norms", w2_norms)
+            w2_norms.weight_loader = self.weight_loader
+            w2_norms._tq_layer = layer
 
             layer._tq_moe_bits = self.bits
             layer._tq_moe_group_size = self.group_size
-            layer._tq_moe_intermediate = intermediate_size_per_partition
+            layer._tq_moe_intermediate = inter_size
             layer._tq_moe_hidden = hidden_size
             layer._tq_moe_num_experts = num_experts
 
         def _decompress_topk_experts(self, layer, topk_ids: torch.Tensor,
                                       x: torch.Tensor):
             """Decompress only the topk_ids experts from packed format.
+
+            w13_weight stores [gate; up] concatenated: each expert has
+            2*inter_size rows (gate first, up second).
+            w2_weight stores down_proj: each expert has inter_size rows.
 
             Returns (gate_deq, up_deq, down_deq) each of shape (num_topk, dim, hidden).
             """
@@ -373,42 +401,60 @@ def register():
             device = x.device
             quantizer = _get_quantizer(group_size, bits, str(device))
 
-            # Decompress gate, up, down for the unique experts in topk_ids
-            results = {}
-            for proj_name, dim_size in [
-                ("gate_proj", inter_size),
-                ("up_proj", inter_size),
-                ("down_proj", hidden_size),
-            ]:
-                packed = getattr(layer, f"{proj_name}_packed").data
-                norms = getattr(layer, f"{proj_name}_norms").data
+            padded_in_w13 = ((inter_size + group_size - 1) // group_size) * group_size
+            padded_in_w2 = ((hidden_size + group_size - 1) // group_size) * group_size
 
-                # Extract rows for the topk experts
-                # Each expert occupies dim_size rows
-                indices = torch.tensor(
-                    [eid * dim_size for eid in unique_ids],
-                    dtype=torch.long, device=device
-                )
-                # Expand to all rows of each expert
-                idx_expanded = indices.unsqueeze(1).repeat(1, dim_size).flatten()
-                offset = torch.arange(dim_size, device=device).unsqueeze(0) * num_topk
-                row_idx = (idx_expanded.unsqueeze(1) + offset).flatten()
+            # Decompress all gate+up rows from w13 at once, then split
+            # w13 layout per expert: [gate; up] = 2*inter_size rows
+            # For gate of expert E at position k: rows (2*E + k) * inter_size + j
+            # For up of expert E at position k: rows (2*E + 1 + k) * inter_size + j
+            w13_packed = layer.w13_weight.data
+            w13_norms = layer.w13_norms.data
+            w2_packed = layer.w2_weight.data
+            w2_norms = layer.w2_norms.data
 
-                proj_packed = packed[row_idx]  # (num_topk * dim_size, packed_cols)
-                proj_norms = norms[row_idx]    # (num_topk * dim_size, n_groups)
+            k_indices = torch.arange(num_topk, device=device, dtype=torch.long)
+            gate_base = torch.tensor([eid * 2 * inter_size for eid in unique_ids],
+                                     dtype=torch.long, device=device)
+            j_indices = torch.arange(inter_size, device=device, dtype=torch.long)
+            gate_row_idx = (gate_base.unsqueeze(1) + j_indices.unsqueeze(0)).flatten()
+            up_base = gate_base + inter_size
+            up_row_idx = (up_base.unsqueeze(1) + j_indices.unsqueeze(0)).flatten()
 
-                # Decompress
-                padded_in = ((dim_size + group_size - 1) // group_size) * group_size
-                indices_unpacked = unpack_indices(proj_packed, bits, group_size)
-                n_groups = padded_in // group_size
-                proj_groups = quantizer.dequantize(
-                    indices_unpacked, proj_norms.reshape(-1)
-                )  # (num_topk * dim_size * n_groups,)
+            gate_packed = w13_packed[gate_row_idx]
+            gate_norms = w13_norms[gate_row_idx]
+            up_packed = w13_packed[up_row_idx]
+            up_norms = w13_norms[up_row_idx]
 
-                proj_deq = proj_groups.reshape(num_topk * dim_size, padded_in)[:, :dim_size]
-                results[proj_name] = proj_deq.reshape(num_topk, dim_size, dim_size).to(x.dtype)
+            # Decompress gate: shape (num_topk, inter_size, inter_size)
+            gate_indices = unpack_indices(gate_packed, bits, group_size)
+            gate_groups = quantizer.dequantize(gate_indices, gate_norms.reshape(-1))
+            gate_deq = gate_groups.reshape(num_topk * inter_size,
+                                          padded_in_w13)[:, :inter_size]
+            gate_w = gate_deq.reshape(num_topk, inter_size, inter_size).to(x.dtype)
 
-            return results["gate_proj"], results["up_proj"], results["down_proj"]
+            # Decompress up: shape (num_topk, inter_size, inter_size)
+            up_indices = unpack_indices(up_packed, bits, group_size)
+            up_groups = quantizer.dequantize(up_indices, up_norms.reshape(-1))
+            up_deq = up_groups.reshape(num_topk * inter_size,
+                                       padded_in_w13)[:, :inter_size]
+            up_w = up_deq.reshape(num_topk, inter_size, inter_size).to(x.dtype)
+
+            # Decompress down from w2: shape (num_topk, hidden_size, inter_size)
+            # w2 layout per expert: inter_size rows
+            # For down of expert E at position k: rows (E + k) * inter_size + j
+            down_base = torch.tensor([eid * inter_size for eid in unique_ids],
+                                      dtype=torch.long, device=device)
+            down_row_idx = (down_base.unsqueeze(1) + j_indices.unsqueeze(0)).flatten()
+            down_packed = w2_packed[down_row_idx]
+            down_norms = w2_norms[down_row_idx]
+            down_indices = unpack_indices(down_packed, bits, group_size)
+            down_groups = quantizer.dequantize(down_indices, down_norms.reshape(-1))
+            down_deq = down_groups.reshape(num_topk * inter_size,
+                                          padded_in_w2)[:, :hidden_size]
+            down_w = down_deq.reshape(num_topk, hidden_size, inter_size).to(x.dtype)
+
+            return gate_w, up_w, down_w
 
         def apply(self, layer, x: torch.Tensor, topk_weights: torch.Tensor,
                   topk_ids: torch.Tensor,
@@ -447,14 +493,15 @@ def register():
                     if w == 0:
                         continue
                     idx = eid_to_idx[eid]
-                    gate = gate_w[idx]
-                    up = up_w[idx]
-                    down = down_w[idx]
+                    gate = gate_w[idx]    # (inter, hidden)
+                    up = up_w[idx]        # (inter, hidden)
+                    down = down_w[idx]     # (hidden, inter) — GLM layout
                     # GLM: h = gate * silu(up) element-wise, then @ down
-                    h_gate = torch.matmul(x[i], gate.t())  # (intermediate,)
-                    h_up = torch.matmul(x[i], up.t())       # (intermediate,)
+                    h_gate = torch.matmul(x[i], gate.t())  # (inter,)
+                    h_up = torch.matmul(x[i], up.t())       # (inter,)
                     h_up_act = h_up * torch.sigmoid(h_up)
                     h = h_gate * h_up_act
+                    # down.t() = (inter, hidden) so h @ down.t() = (inter,) @ (inter, hidden) = (hidden,)
                     out = torch.matmul(h, down.t()) * w
                     output[i] += out
 
@@ -469,43 +516,40 @@ def register():
         def load_weights(self, layer, weights) -> Iterable[str]:
             """Custom weight loading for GLM MoE checkpoints.
 
-            GLM has: experts.{E}.gate_proj.weight.tq_packed (per expert, 2D).
-            We map these to our gate_packed/up_packed/down_packed params.
+            GLM checkpoint stores separate gate_proj/up_proj/down_proj per expert.
+            expert_params_mapping (from SharedFusedMoE.make_expert_params_mapping)
+            expects params named w13_weight (gate+up fused) and w2_weight (down).
+
+            Our w13_weight stores [gate; up] concatenated: each expert occupies
+            2*intermediate rows. w2_weight stores down: each expert occupies
+            intermediate rows.
             """
-            num_experts = layer._tq_moe_num_experts
             hidden_size = layer._tq_moe_hidden
             inter_size = layer._tq_moe_intermediate
 
-            # Build mapping: checkpoint name prefix → (param_name, dim_size)
-            # GLM checkpoint has SEPARATE entries for tq_packed and tq_norms:
-            #   experts.{E}.gate_proj.weight.tq_packed  → gate_proj_packed[E*dim_size:(E+1)*dim_size]
-            #   experts.{E}.gate_proj.weight.tq_norms   → gate_proj_norms[E*dim_size:(E+1)*dim_size]
-            proj_to_param = {
-                "gate_proj": ("gate_proj_packed", "gate_proj_norms", inter_size),
-                "up_proj":   ("up_proj_packed",   "up_proj_norms",   inter_size),
-                "down_proj": ("down_proj_packed", "down_proj_norms", hidden_size),
-            }
-
+            # Mapping from GLM checkpoint name patterns to our storage
+            # GLM: experts.{E}.gate_proj.weight.tq_packed → w13_weight
+            #       experts.{E}.up_proj.weight.tq_packed   → w13_weight
+            #       experts.{E}.down_proj.weight.tq_packed → w2_weight
             for expert_name, loaded_weight in weights:
-                # Determine which projection and weight type (packed or norms)
-                param_base = None
-                dim_size = None
+                # Determine projection type and weight type (packed or norms)
+                proj_type = None  # "gate", "up", "down"
+                weight_type = None  # "packed" or "norms"
 
-                for proj_name, (packed_param, norms_param, dsize) in proj_to_param.items():
-                    if f".{proj_name}.weight.tq_packed" in expert_name:
-                        param_base = packed_param
-                        dim_size = dsize
+                for pt in ("gate_proj", "up_proj", "down_proj"):
+                    if f".{pt}.weight.tq_packed" in expert_name:
+                        proj_type = pt.replace("_proj", "")
+                        weight_type = "packed"
                         break
-                    elif f".{proj_name}.weight.tq_norms" in expert_name:
-                        param_base = norms_param
-                        dim_size = dsize
+                    elif f".{pt}.weight.tq_norms" in expert_name:
+                        proj_type = pt.replace("_proj", "")
+                        weight_type = "norms"
                         break
 
-                if param_base is None:
+                if proj_type is None:
                     continue  # Not a MoE expert weight
 
-                # Extract global expert ID from checkpoint key like:
-                # model.layers.10.mlp.experts.64.gate_proj.weight.tq_packed
+                # Extract global expert ID
                 experts_pos = expert_name.find("experts.")
                 if experts_pos == -1:
                     continue
@@ -513,27 +557,83 @@ def register():
                 end = expert_name.find(".", start)
                 global_expert_id = int(expert_name[start:end])
 
-                # Use expert_map to convert global → local index.
-                # For EP rank 1 with experts 64-127: expert_map[64]=0, expert_map[65]=1, etc.
-                # For EP rank 0 with experts 0-64: expert_map[0]=0, expert_map[1]=1, etc.
-                # If expert_map is None (EP=1), global_id == local_id.
+                # Convert global → local via expert_map
                 if layer._expert_map is not None:
                     local_idx = layer._expert_map[global_expert_id].item()
                     if local_idx < 0:
-                        continue  # This expert is not on this EP rank
+                        continue
                 else:
                     local_idx = global_expert_id
 
-                param = getattr(layer, param_base)
-                start_row = local_idx * dim_size
-                end_row = start_row + dim_size
+                # Copy to the correct location in our w13_weight or w2_weight
+                if proj_type in ("gate", "up"):
+                    # w13_weight: each expert has 2*inter_size rows
+                    # gate → first inter_size rows, up → second inter_size rows
+                    base_row = local_idx * 2 * inter_size
+                    if proj_type == "gate":
+                        dest_row = base_row  # first half
+                    else:
+                        dest_row = base_row + inter_size  # second half
 
+                    param_name = ("w13_weight" if weight_type == "packed"
+                                  else "w13_norms")
+                    dim_size = inter_size
+                else:  # down
+                    param_name = ("w2_weight" if weight_type == "packed"
+                                  else "w2_norms")
+                    dest_row = local_idx * hidden_size
+                    dim_size = hidden_size
+
+                param = getattr(layer, param_name)
                 if loaded_weight.dim() == 2:
-                    param.data[start_row:end_row] = loaded_weight.contiguous()
+                    param.data[dest_row:dest_row + dim_size] = loaded_weight.contiguous()
                 else:
-                    param.data[start_row:end_row] = loaded_weight.squeeze(0).contiguous()
+                    param.data[dest_row:dest_row + dim_size] = loaded_weight.squeeze(0).contiguous()
 
                 yield expert_name
+
+        def weight_loader(self, param, loaded_weight, name_mapped,
+                         shard_id=None, expert_id=None, return_success=False):
+            """Intercept weight loading from expert_params_mapping loop.
+
+            expert_params_mapping maps checkpoint gate_proj → w13_weight.
+            We handle the GLM separate gate/up → w13 concatenation here.
+
+            Called from deepseek_v2.load_weights → expert_params_mapping loop
+            via param.weight_loader(param, loaded_weight, name_mapped,
+                                   shard_id=shard_id, expert_id=expert_id,
+                                   return_success=True).
+
+            The layer is accessed via param._tq_layer (set in create_weights).
+            """
+            layer = getattr(param, '_tq_layer', None)
+            if layer is None:
+                return False if return_success else None
+
+            # Determine projection type from shard_id
+            # shard_id: "w1"=gate, "w2"=down, "w3"=up
+            if shard_id == "w2":
+                param_name = "w2_weight"
+                dest_row = expert_id * layer._tq_moe_hidden
+                dim_size = layer._tq_moe_hidden
+            elif shard_id in ("w1", "w3"):
+                param_name = "w13_weight"
+                base_row = expert_id * 2 * layer._tq_moe_intermediate
+                dest_row = base_row if shard_id == "w1" else base_row + layer._tq_moe_intermediate
+                dim_size = layer._tq_moe_intermediate
+            else:
+                return False if return_success else None
+
+            target_param = getattr(layer, param_name, None)
+            if target_param is None:
+                return False if return_success else None
+
+            if loaded_weight.dim() == 2:
+                target_param.data[dest_row:dest_row + dim_size] = loaded_weight.contiguous()
+            else:
+                target_param.data[dest_row:dest_row + dim_size] = loaded_weight.squeeze(0).contiguous()
+
+            return True if return_success else None
 
     # ------------------------------------------------------------------
     # Patch FusedMoE.load_weights to delegate to quant_method's loader
