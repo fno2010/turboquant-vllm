@@ -132,6 +132,18 @@ def register():
                 # Determine bits for this layer
                 layer_bits = select_bits(prefix, self.bits, self.sensitive_bits)
                 return TurboQuantLinearMethod(self, layer_bits)
+
+            # FusedMoE expert weights
+            try:
+                from vllm.model_executor.layers.fused_moe import FusedMoE
+
+                if isinstance(layer, FusedMoE):
+                    return TurboQuantFusedMoELoadMethod(
+                        layer.moe_config, self.bits, self.group_size
+                    )
+            except ImportError:
+                pass
+
             return None
 
     class TurboQuantLinearMethod(LinearMethodBase):
@@ -286,6 +298,179 @@ def register():
                 output = output + bias
             return output
 
+    # ------------------------------------------------------------------
+    # FusedMoE: load TQ3-packed expert weights from native checkpoint
+    # ------------------------------------------------------------------
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    from vllm.model_executor.utils import set_weight_attrs
+
+    class TurboQuantFusedMoELoadMethod(FusedMoEMethodBase):
+        """Load TQ3-packed MoE expert weights from a native TQ3 checkpoint.
+
+        Expert weights are stored as 3D packed uint8 + float32 norms in
+        the checkpoint.  ``create_weights`` registers placeholder bf16
+        parameters (``w13_weight``, ``w2_weight``) sized for the
+        decompressed experts *and* the packed/norms tensors.  The
+        weight_loader fills the packed parameters from the checkpoint.
+        ``apply()`` decompresses into scratch buffers (shared across all
+        FusedMoE layers) and delegates to
+        ``fused_experts(..., quant_config=None)`` — the same kernel path
+        as unquantized bf16.
+        """
+
+        def __init__(self, moe_config, bits: int, group_size: int):
+            super().__init__(moe_config)
+            self.bits = bits
+            self.group_size = group_size
+            self._scratch_pool = None  # lazy-init, shared across layers
+
+        def create_weights(
+            self,
+            layer: nn.Module,
+            num_experts: int,
+            hidden_size: int,
+            intermediate_size_per_partition: int,
+            params_dtype: torch.dtype,
+            **extra_weight_attrs,
+        ):
+            from turboquant_vllm.weight_quant import packed_group_bytes as _packed_group_bytes
+
+            bits = self.bits
+            gs = self.group_size
+
+            # w13: (num_experts, 2*intermediate, hidden) — gate+up fused
+            # w2:  (num_experts, hidden, intermediate)
+            w13_out = 2 * intermediate_size_per_partition
+            w2_out = hidden_size
+            w13_in = hidden_size
+            w2_in = intermediate_size_per_partition
+
+            def _packed_shape(n_exp, out_dim, in_dim):
+                """Return (n_exp * out_dim, packed_cols) for 3D→2D packed storage."""
+                padded = ((in_dim + gs - 1) // gs) * gs
+                n_groups = padded // gs
+                pgb = _packed_group_bytes(bits, gs)
+                return (n_exp * out_dim, n_groups * pgb)
+
+            def _norms_shape(n_exp, out_dim, in_dim):
+                padded = ((in_dim + gs - 1) // gs) * gs
+                n_groups = padded // gs
+                return (n_exp * out_dim, n_groups)
+
+            weight_loader = extra_weight_attrs.get("weight_loader")
+
+            # Packed indices (uint8)
+            w13_packed = nn.Parameter(
+                torch.empty(*_packed_shape(num_experts, w13_out, w13_in), dtype=torch.uint8),
+                requires_grad=False,
+            )
+            w2_packed = nn.Parameter(
+                torch.empty(*_packed_shape(num_experts, w2_out, w2_in), dtype=torch.uint8),
+                requires_grad=False,
+            )
+            # Norms (float32)
+            w13_norms = nn.Parameter(
+                torch.empty(*_norms_shape(num_experts, w13_out, w13_in), dtype=torch.float32),
+                requires_grad=False,
+            )
+            w2_norms = nn.Parameter(
+                torch.empty(*_norms_shape(num_experts, w2_out, w2_in), dtype=torch.float32),
+                requires_grad=False,
+            )
+
+            layer.register_parameter("w13_tq_packed", w13_packed)
+            layer.register_parameter("w13_tq_norms", w13_norms)
+            layer.register_parameter("w2_tq_packed", w2_packed)
+            layer.register_parameter("w2_tq_norms", w2_norms)
+
+            # Scratch buffers for decompressed bf16 experts (shared across layers)
+            # Actual allocation deferred to first forward when device is known.
+            layer._tq_bits = bits
+            layer._tq_group_size = gs
+            layer._tq_num_experts = num_experts
+            layer._tq_w13_shape = (num_experts, w13_out, w13_in)
+            layer._tq_w2_shape = (num_experts, w2_out, w2_in)
+
+            # Also register bf16 weight placeholders that the base
+            # unquantized kernel reads. Re-pointed at scratch on first apply().
+            w13_weight = nn.Parameter(
+                torch.empty(num_experts, w13_out, w13_in, dtype=params_dtype),
+                requires_grad=False,
+            )
+            w2_weight = nn.Parameter(
+                torch.empty(num_experts, w2_out, w2_in, dtype=params_dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight", w13_weight)
+            layer.register_parameter("w2_weight", w2_weight)
+            set_weight_attrs(w13_weight, extra_weight_attrs)
+            set_weight_attrs(w2_weight, extra_weight_attrs)
+
+            # Mark packed/norms parameters so the weight loader knows to
+            # handle them with full_load (checkpoint stores already-fused 3D
+            # packed data as 2D, not per-expert).
+            for p in (w13_packed, w13_norms, w2_packed, w2_norms):
+                set_weight_attrs(p, {"weight_loader": weight_loader})
+
+        def get_fused_moe_quant_config(self, layer: nn.Module):
+            return None
+
+        def _ensure_scratch(self, layer: nn.Module):
+            """Lazily allocate shared scratch buffers on first forward."""
+            if self._scratch_pool is not None:
+                return
+            device = layer.w13_tq_packed.device
+            dtype = layer.w13_weight.dtype
+            w13_shape = layer._tq_w13_shape
+            w2_shape = layer._tq_w2_shape
+            self._scratch_pool = {
+                "w13": torch.empty(w13_shape, dtype=dtype, device=device),
+                "w2": torch.empty(w2_shape, dtype=dtype, device=device),
+                "w13_fp32": torch.empty(w13_shape, dtype=torch.float32, device=device),
+                "w2_fp32": torch.empty(w2_shape, dtype=torch.float32, device=device),
+            }
+            # Re-point the bf16 weight placeholders at the scratch buffers
+            layer.w13_weight.data = self._scratch_pool["w13"]
+            layer.w2_weight.data = self._scratch_pool["w2"]
+
+        def apply(
+            self,
+            layer: nn.Module,
+            x: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            shared_experts_input: torch.Tensor | None = None,
+        ):
+            from turboquant_vllm.weight_quant import Compressed3D
+
+            self._ensure_scratch(layer)
+            pool = self._scratch_pool
+            bits = layer._tq_bits
+            gs = layer._tq_group_size
+
+            # Build Compressed3D from loaded packed data and decompress
+            dtype = pool["w13"].dtype
+            for prefix in ("w13", "w2"):
+                packed = getattr(layer, f"{prefix}_tq_packed").data
+                norms = getattr(layer, f"{prefix}_tq_norms").data
+                shape = getattr(layer, f"_tq_{prefix}_shape")
+                comp = Compressed3D.from_packed(packed, norms, shape, dtype, bits, gs)
+                comp.decompress_into(pool[prefix], fp32_scratch=pool[f"{prefix}_fp32"])
+
+            # Delegate to unquantized fused_experts kernel
+            from vllm.model_executor.layers.fused_moe import fused_experts
+
+            return fused_experts(
+                x,
+                pool["w13"],
+                pool["w2"],
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=not self.moe.disable_inplace,
+            )
+
     # Patch the weight loader to remap old-style checkpoint names
     # Old: model.layers.0.self_attn.q_proj.weight.tq_packed
     # New: model.layers.0.self_attn.q_proj.tq_packed
@@ -305,11 +490,23 @@ def _patch_weight_name_remapping():
 
     def _remapped_get_all_weights(self, model_config, model):
         for name, tensor in _original_get_all_weights(self, model_config, model):
-            # Remap old-style .weight.tq_packed → .tq_packed
+            # Remap checkpoint names to match registered parameter names.
+            #
+            # 2D linears: q_proj.weight.tq_packed → q_proj.tq_packed
+            # 3D MoE:     w13_weight.tq_packed → w13_tq_packed
+            #             (underscore, not dot, because FusedMoE registers
+            #             flat parameter names like w13_tq_packed)
             if ".weight.tq_packed" in name:
-                name = name.replace(".weight.tq_packed", ".tq_packed")
+                # Check if it's a FusedMoE expert (w13_weight or w2_weight)
+                if "w13_weight.tq_packed" in name or "w2_weight.tq_packed" in name:
+                    name = name.replace("_weight.tq_packed", "_tq_packed")
+                else:
+                    name = name.replace(".weight.tq_packed", ".tq_packed")
             elif ".weight.tq_norms" in name:
-                name = name.replace(".weight.tq_norms", ".tq_norms")
+                if "w13_weight.tq_norms" in name or "w2_weight.tq_norms" in name:
+                    name = name.replace("_weight.tq_norms", "_tq_norms")
+                else:
+                    name = name.replace(".weight.tq_norms", ".tq_norms")
             yield name, tensor
 
     DefaultModelLoader.get_all_weights = _remapped_get_all_weights

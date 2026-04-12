@@ -171,6 +171,17 @@ def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
         return indices.to(torch.uint8)
 
 
+def packed_group_bytes(bits: int, group_size: int) -> int:
+    """Return the number of packed bytes per group for a given bit-width."""
+    if bits == 4:
+        return group_size // 2
+    elif bits == 3:
+        return (group_size // 8) * 3
+    elif bits == 2:
+        return group_size // 4
+    return group_size
+
+
 def unpack_indices(packed: torch.Tensor, bits: int, dim: int) -> torch.Tensor:
     """Unpack uint8 packed indices back to int64."""
     if bits == 4:
