@@ -579,7 +579,7 @@ class Compressed3D:
         )
 
         cuda_mod = _get_cuda_module()
-        if cuda_mod is None:
+        if cuda_mod is None or not self.packed.is_cuda:
             out.copy_(self.decompress())
             return
 
@@ -623,7 +623,7 @@ class Compressed3D:
         cuda_mod = _get_cuda_module()
         n_experts, out_dim, in_dim = self.shape
 
-        if cuda_mod is not None:
+        if cuda_mod is not None and self.packed.is_cuda:
             output_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
             if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == output_dtype:
                 output = buf

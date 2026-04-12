@@ -519,11 +519,7 @@ def _patch_weight_name_remapping():
     except ImportError:
         return
 
-    from turboquant_vllm.weight_quant import (
-        unpack_indices,
-        _get_quantizer,
-        padded_size,
-    )
+    from turboquant_vllm.weight_quant import Compressed3D
 
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
@@ -564,20 +560,19 @@ def _patch_weight_name_remapping():
                 packed = pending_packed.pop(base)
                 norms = pending_norms.pop(base)
 
-                # Decompress on CPU to bf16
-                quantizer = _get_quantizer(group_size, bits, "cpu")
-                indices = unpack_indices(packed, bits, group_size)
-                norms_flat = norms.reshape(-1)
-                w_groups = quantizer.dequantize(indices, norms_flat)
+                # Decompress on CPU to bf16 via Compressed3D (works for
+                # 2D by treating as (1, n_rows, in_dim)).
                 n_rows = norms.shape[0]
-                padded_in, _ = padded_size(w_groups.shape[-1], group_size)
-                # Determine original in_dim from packed shape
-                in_dim = padded_in  # might be padded; trimmed by model loader
-                w = w_groups.reshape(n_rows, -1)[:, :in_dim].to(torch.bfloat16)
+                n_groups = norms.shape[1]
+                in_dim = n_groups * group_size
+                comp = Compressed3D.from_packed(
+                    packed, norms, (1, n_rows, in_dim),
+                    torch.bfloat16, bits, group_size,
+                )
+                w = comp.decompress().squeeze(0)  # (1, n_rows, in_dim) → (n_rows, in_dim)
 
-                # Yield with original weight name
                 yield base, w
-                del packed, norms, indices, w_groups, w
+                del packed, norms, comp, w
 
         # Flush any orphaned packed/norms (shouldn't happen with valid checkpoints)
         for base in pending_packed:
