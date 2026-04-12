@@ -125,10 +125,21 @@ def register():
         ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
             # Native TQ3 checkpoints are decompressed to bf16 during
             # weight loading (see _patch_weight_name_remapping).  All
-            # layers receive standard bf16 weights, so we return None
-            # to let vLLM use its default unquantized methods.  The
-            # runtime plugin (enable_weight_quantization) re-compresses
-            # on GPU after loading.
+            # layers receive standard bf16 weights via unquantized
+            # methods.  The runtime plugin (enable_weight_quantization)
+            # re-compresses on GPU after loading.
+            if isinstance(layer, LinearBase):
+                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+                return UnquantizedLinearMethod()
+            try:
+                from vllm.model_executor.layers.fused_moe import FusedMoE
+                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                    UnquantizedFusedMoEMethod,
+                )
+                if isinstance(layer, FusedMoE):
+                    return UnquantizedFusedMoEMethod(layer.moe_config)
+            except ImportError:
+                pass
             return None
 
     class TurboQuantLinearMethod(LinearMethodBase):
