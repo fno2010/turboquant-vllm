@@ -142,9 +142,20 @@ def _patch_weight_name_remapping():
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
     def _decompress_get_all_weights(self, model_config, model):
-        # Detect TQ3 checkpoint via tq_config.json (not quantization_config
-        # in config.json — that would trigger vLLM's quant code path and
-        # break CUDA graph capture).
+        """Decompress TQ3 → bf16 per tensor, compress each layer on GPU
+        immediately after its weights land.
+
+        This keeps peak GPU memory at ~1 layer bf16 + all previously
+        compressed layers, instead of the full model in bf16.  Critical
+        for fitting 309 GB models on 2×H200 (282 GB).
+
+        Flow per layer:
+          1. Generator yields decompressed bf16 tensors for layer N
+          2. vLLM's weight_loader places each on GPU
+          3. Generator detects layer N+1 starting → compresses layer N
+             on GPU via _replace_linear_layers, freeing bf16 memory
+          4. Repeat for layer N+1
+        """
         import os as _os
 
         tq_config_path = _os.path.join(model_config.model, "tq_config.json")
@@ -153,32 +164,75 @@ def _patch_weight_name_remapping():
             return
 
         import json as _json
+        import re
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
-        logger.info("TQ3 native checkpoint detected (bits=%d, group_size=%d), decompressing on load", bits, group_size)
+        logger.info(
+            "TQ3 native checkpoint detected (bits=%d, group_size=%d), "
+            "streaming decompress + per-layer compression",
+            bits, group_size,
+        )
 
-        # Collect packed/norms pairs, decompress, yield as bf16.
-        # Tensors arrive in checkpoint order — packed and norms for the
-        # same weight are adjacent (both in the same shard, consecutive).
-        pending_packed = {}  # base_name → packed tensor
-        pending_norms = {}   # base_name → norms tensor
+        # Import compression function for per-layer GPU compression
+        from turboquant_vllm.weight_quant import _replace_linear_layers
+
+        # Track which layer is currently being loaded
+        _layer_re = re.compile(r"model\.layers\.(\d+)\.")
+        prev_layer_idx = None
+        compressed_layers = 0
+
+        def _compress_prev_layer(layer_idx):
+            """Compress a single decoder layer's weights on GPU."""
+            nonlocal compressed_layers
+            try:
+                # Navigate to the specific layer module
+                layers = model.model.layers
+                if layer_idx < len(layers):
+                    layer_module = layers[layer_idx]
+                    count = _replace_linear_layers(
+                        layer_module, bits=bits, group_size=group_size,
+                    )
+                    if count > 0:
+                        compressed_layers += count
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if compressed_layers % 50 == 0:
+                            mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+                            logger.info(
+                                "  Compressed layer %d (%d total layers, %.1f GB GPU)",
+                                layer_idx, compressed_layers, mem,
+                            )
+            except Exception as e:
+                logger.debug("Per-layer compression skipped for layer %d: %s", layer_idx, e)
+
+        pending_packed = {}
+        pending_norms = {}
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
+            # Detect layer boundary
+            m = _layer_re.search(name)
+            cur_layer_idx = int(m.group(1)) if m else None
+
+            if cur_layer_idx is not None and cur_layer_idx != prev_layer_idx:
+                if prev_layer_idx is not None:
+                    _compress_prev_layer(prev_layer_idx)
+                prev_layer_idx = cur_layer_idx
+
+            # Handle TQ3 packed tensors
             if name.endswith(".weight.tq_packed"):
-                base = name[: -len(".tq_packed")]  # e.g. "layers.0.q_proj.weight"
+                base = name[: -len(".tq_packed")]
                 pending_packed[base] = tensor
             elif name.endswith(".weight.tq_norms"):
                 base = name[: -len(".tq_norms")]
                 pending_norms[base] = tensor
             else:
-                # Regular tensor — yield as-is
                 yield name, tensor
                 continue
 
-            # Check if we have both packed + norms for this weight
+            # Check if pair is complete
             base_p = name[: -len(".tq_packed")] if name.endswith(".tq_packed") else None
             base_n = name[: -len(".tq_norms")] if name.endswith(".tq_norms") else None
             base = base_p or base_n
@@ -187,8 +241,6 @@ def _patch_weight_name_remapping():
                 packed = pending_packed.pop(base)
                 norms = pending_norms.pop(base)
 
-                # Decompress on CPU to bf16 via Compressed3D (works for
-                # 2D by treating as (1, n_rows, in_dim)).
                 n_rows = norms.shape[0]
                 n_groups = norms.shape[1]
                 in_dim = n_groups * group_size
@@ -196,16 +248,21 @@ def _patch_weight_name_remapping():
                     packed, norms, (1, n_rows, in_dim),
                     torch.bfloat16, bits, group_size,
                 )
-                w = comp.decompress().squeeze(0)  # (1, n_rows, in_dim) → (n_rows, in_dim)
-
-                if w.isnan().any() or w.isinf().any():
-                    logger.error("TQ3 decompress produced NaN/Inf for %s shape=%s", base, w.shape)
-                logger.debug("TQ3 decompress: %s → %s (max=%.3f)", base, tuple(w.shape), w.abs().max().item())
-
+                w = comp.decompress().squeeze(0)
                 yield base, w
                 del packed, norms, comp, w
 
-        # Flush any orphaned packed/norms (shouldn't happen with valid checkpoints)
+        # Compress the last layer
+        if prev_layer_idx is not None:
+            _compress_prev_layer(prev_layer_idx)
+
+        if compressed_layers > 0:
+            mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+            logger.info(
+                "Streaming compression complete: %d layers compressed, %.1f GB GPU",
+                compressed_layers, mem,
+            )
+
         for base in pending_packed:
             logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
         for base in pending_norms:

@@ -878,6 +878,9 @@ def _replace_linear_layers(
     # Also match vLLM's parallel linear layers (ColumnParallelLinear, etc.)
     # which have .weight but inherit from LinearBase, not nn.Linear
     for name, module in list(model.named_modules()):
+        # Skip modules already compressed by per-layer streaming compression
+        if isinstance(module, TurboQuantWrapper):
+            continue
         if not isinstance(module, nn.Linear):
             # Check for vLLM parallel linears: have weight + input_size/output_size
             if not (
@@ -1002,6 +1005,9 @@ def _replace_linear_layers(
             if not isinstance(module, FusedMoE):
                 continue
             if any(p in name.lower() for p in _SKIP_PATTERNS):
+                continue
+            # Skip already-compressed FusedMoE (per-layer streaming compression)
+            if hasattr(module, "_tq_w13_weight"):
                 continue
 
             w13_param = getattr(module, "w13_weight", None)
