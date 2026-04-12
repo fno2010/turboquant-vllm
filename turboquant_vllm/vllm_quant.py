@@ -192,6 +192,10 @@ def _patch_weight_name_remapping():
                 )
                 w = comp.decompress().squeeze(0)  # (1, n_rows, in_dim) → (n_rows, in_dim)
 
+                if w.isnan().any() or w.isinf().any():
+                    logger.error("TQ3 decompress produced NaN/Inf for %s shape=%s", base, w.shape)
+                logger.debug("TQ3 decompress: %s → %s (max=%.3f)", base, tuple(w.shape), w.abs().max().item())
+
                 yield base, w
                 del packed, norms, comp, w
 
