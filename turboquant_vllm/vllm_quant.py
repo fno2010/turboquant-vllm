@@ -1,28 +1,22 @@
-"""TurboQuant quantization config for native vLLM integration.
+"""TurboQuant vLLM integration: quantization config + TQ3 checkpoint loader.
 
-Registers as a vLLM quantization method so TQ3/TQ4 checkpoints can be loaded
-with tensor parallelism. Uses the same dequant kernels as TurboQuantWrapper.
-
-Usage:
-    # Checkpoint must have quantization_config in config.json:
-    # {"quantization_config": {"quant_method": "turboquant", "bits": 3, "group_size": 128}}
-    #
-    # Then just:
-    vllm serve ./my-tq3-checkpoint --quantization turboquant
+Two roles:
+1. Register ``TurboQuantConfig`` so vLLM recognises ``quantization_config``
+   in config.json (backward compat for old checkpoints).
+2. Patch ``DefaultModelLoader.get_all_weights`` to detect ``tq_config.json``
+   and decompress TQ3 packed weights on load, with per-layer GPU compression
+   to keep peak VRAM at ~1 layer bf16 + all previously compressed layers.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    pass
 
 
 def _lazy_import_vllm():
@@ -187,26 +181,22 @@ def _patch_weight_name_remapping():
         def _compress_prev_layer(layer_idx):
             """Compress a single decoder layer's weights on GPU."""
             nonlocal compressed_layers
-            try:
-                # Navigate to the specific layer module
-                layers = model.model.layers
-                if layer_idx < len(layers):
-                    layer_module = layers[layer_idx]
-                    count = _replace_linear_layers(
-                        layer_module, bits=bits, group_size=group_size,
+            layers = getattr(getattr(model, "model", None), "layers", None)
+            if layers is None or layer_idx >= len(layers):
+                return
+            count = _replace_linear_layers(
+                layers[layer_idx], bits=bits, group_size=group_size,
+            )
+            if count > 0:
+                compressed_layers += count
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if compressed_layers % 50 == 0:
+                    mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+                    logger.info(
+                        "  Compressed layer %d (%d total, %.1f GB GPU)",
+                        layer_idx, compressed_layers, mem,
                     )
-                    if count > 0:
-                        compressed_layers += count
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        if compressed_layers % 50 == 0:
-                            mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-                            logger.info(
-                                "  Compressed layer %d (%d total layers, %.1f GB GPU)",
-                                layer_idx, compressed_layers, mem,
-                            )
-            except Exception as e:
-                logger.debug("Per-layer compression skipped for layer %d: %s", layer_idx, e)
 
         pending_packed = {}
         pending_norms = {}
@@ -221,7 +211,7 @@ def _patch_weight_name_remapping():
                     _compress_prev_layer(prev_layer_idx)
                 prev_layer_idx = cur_layer_idx
 
-            # Handle TQ3 packed tensors
+            # Handle TQ3 packed tensors — collect pairs, decompress when complete
             if name.endswith(".weight.tq_packed"):
                 base = name[: -len(".tq_packed")]
                 pending_packed[base] = tensor
@@ -231,11 +221,6 @@ def _patch_weight_name_remapping():
             else:
                 yield name, tensor
                 continue
-
-            # Check if pair is complete
-            base_p = name[: -len(".tq_packed")] if name.endswith(".tq_packed") else None
-            base_n = name[: -len(".tq_norms")] if name.endswith(".tq_norms") else None
-            base = base_p or base_n
 
             if base in pending_packed and base in pending_norms:
                 packed = pending_packed.pop(base)
