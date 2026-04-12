@@ -123,27 +123,12 @@ def register():
         def get_quant_method(
             self, layer: nn.Module, prefix: str
         ) -> Union["LinearMethodBase", "QuantizeMethodBase"] | None:
-            if isinstance(layer, LinearBase):
-                # Skip layers that shouldn't be quantized
-                if any(p in prefix.lower() for p in _SKIP_PATTERNS):
-                    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
-                    return UnquantizedLinearMethod()
-                # Determine bits for this layer
-                layer_bits = select_bits(prefix, self.bits, self.sensitive_bits)
-                return TurboQuantLinearMethod(self, layer_bits)
-
-            # FusedMoE expert weights
-            try:
-                from vllm.model_executor.layers.fused_moe import FusedMoE
-
-                if isinstance(layer, FusedMoE):
-                    return TurboQuantFusedMoELoadMethod(
-                        layer.moe_config, self.bits, self.group_size
-                    )
-            except ImportError:
-                pass
-
+            # Native TQ3 checkpoints are decompressed to bf16 during
+            # weight loading (see _patch_weight_name_remapping).  All
+            # layers receive standard bf16 weights, so we return None
+            # to let vLLM use its default unquantized methods.  The
+            # runtime plugin (enable_weight_quantization) re-compresses
+            # on GPU after loading.
             return None
 
     class TurboQuantLinearMethod(LinearMethodBase):
@@ -506,28 +491,87 @@ def register():
 
 
 def _patch_weight_name_remapping():
-    """Monkey-patch vLLM's weight iterator to remap old TQ checkpoint names."""
+    """Monkey-patch vLLM's weight iterator to decompress TQ3 weights on load.
+
+    When a native TQ3 checkpoint is loaded, the checkpoint contains
+    ``.tq_packed`` / ``.tq_norms`` tensor pairs instead of standard
+    ``.weight`` tensors.  This patch collects each pair, decompresses
+    to bf16 on CPU, and yields the result with the original weight name.
+    vLLM's model-specific weight loaders (stacked qkv, fused gate_up,
+    expert assembly) then work unchanged.
+
+    After loading, the runtime plugin re-compresses weights on GPU via
+    ``enable_weight_quantization`` — so the bf16 is transient.
+    """
     try:
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
     except ImportError:
         return
 
+    from turboquant_vllm.weight_quant import (
+        unpack_indices,
+        _get_quantizer,
+        padded_size,
+    )
+
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
-    def _remapped_get_all_weights(self, model_config, model):
-        for name, tensor in _original_get_all_weights(self, model_config, model):
-            # Remap checkpoint .weight.tq_* names to registered param names.
-            # 2D linears: q_proj.weight.tq_packed → q_proj.tq_packed
-            # 3D MoE:     w13_weight.tq_packed → w13_tq_packed
-            for suffix in (".tq_packed", ".tq_norms"):
-                old = ".weight" + suffix
-                if old in name:
-                    # MoE experts use underscore join (w13_tq_packed)
-                    if "w13_weight" + suffix in name or "w2_weight" + suffix in name:
-                        name = name.replace("_weight" + suffix, "_" + suffix[1:])
-                    else:
-                        name = name.replace(old, suffix)
-                    break
-            yield name, tensor
+    def _decompress_get_all_weights(self, model_config, model):
+        # Check if this is a TQ checkpoint
+        quant_cfg = getattr(model_config.hf_config, "quantization_config", None)
+        if not quant_cfg or quant_cfg.get("quant_method") != "turboquant":
+            yield from _original_get_all_weights(self, model_config, model)
+            return
 
-    DefaultModelLoader.get_all_weights = _remapped_get_all_weights
+        bits = quant_cfg.get("bits", 3)
+        group_size = quant_cfg.get("group_size", 128)
+
+        # Collect packed/norms pairs, decompress, yield as bf16.
+        # Tensors arrive in checkpoint order — packed and norms for the
+        # same weight are adjacent (both in the same shard, consecutive).
+        pending_packed = {}  # base_name → packed tensor
+        pending_norms = {}   # base_name → norms tensor
+
+        for name, tensor in _original_get_all_weights(self, model_config, model):
+            if name.endswith(".weight.tq_packed"):
+                base = name[: -len(".tq_packed")]  # e.g. "layers.0.q_proj.weight"
+                pending_packed[base] = tensor
+            elif name.endswith(".weight.tq_norms"):
+                base = name[: -len(".tq_norms")]
+                pending_norms[base] = tensor
+            else:
+                # Regular tensor — yield as-is
+                yield name, tensor
+                continue
+
+            # Check if we have both packed + norms for this weight
+            base_p = name[: -len(".tq_packed")] if name.endswith(".tq_packed") else None
+            base_n = name[: -len(".tq_norms")] if name.endswith(".tq_norms") else None
+            base = base_p or base_n
+
+            if base in pending_packed and base in pending_norms:
+                packed = pending_packed.pop(base)
+                norms = pending_norms.pop(base)
+
+                # Decompress on CPU to bf16
+                quantizer = _get_quantizer(group_size, bits, "cpu")
+                indices = unpack_indices(packed, bits, group_size)
+                norms_flat = norms.reshape(-1)
+                w_groups = quantizer.dequantize(indices, norms_flat)
+                n_rows = norms.shape[0]
+                padded_in, _ = padded_size(w_groups.shape[-1], group_size)
+                # Determine original in_dim from packed shape
+                in_dim = padded_in  # might be padded; trimmed by model loader
+                w = w_groups.reshape(n_rows, -1)[:, :in_dim].to(torch.bfloat16)
+
+                # Yield with original weight name
+                yield base, w
+                del packed, norms, indices, w_groups, w
+
+        # Flush any orphaned packed/norms (shouldn't happen with valid checkpoints)
+        for base in pending_packed:
+            logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
+        for base in pending_norms:
+            logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
+
+    DefaultModelLoader.get_all_weights = _decompress_get_all_weights
