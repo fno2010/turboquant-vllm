@@ -316,6 +316,9 @@ def register():
                 if count > 0:
                     logger.info("TQ%d compressed %d MoE sub-layers", layer.tq_bits, count)
 
+            def get_fused_moe_quant_config(self, layer: nn.Module):
+                return self._unquant.get_fused_moe_quant_config(layer)
+
             def apply(self, layer: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
                 return self._unquant.apply(layer, x, **kwargs)
 
