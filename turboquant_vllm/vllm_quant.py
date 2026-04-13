@@ -275,9 +275,9 @@ def register():
             uses_meta_device: bool = True
 
             def __init__(self, bits: int, group_size: int, moe_config: Any):
+                super().__init__(moe_config)
                 self.bits = bits
                 self.group_size = group_size
-                self.moe_config = moe_config
                 self._unquant = UnquantizedFusedMoEMethod(moe_config)
 
             def create_weights(self, layer: nn.Module, **kwargs):
