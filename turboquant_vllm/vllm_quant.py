@@ -158,11 +158,14 @@ def _patch_weight_name_remapping():
         if not _os.path.isfile(tq_config_path):
             try:
                 from huggingface_hub import hf_hub_download
+                revision = getattr(model_config, "revision", None)
                 tq_config_path = hf_hub_download(
                     model_config.model, "tq_config.json",
-                    revision=model_config.revision,
+                    revision=revision,
                 )
-            except Exception:
+                logger.info("Found tq_config.json via HuggingFace: %s", tq_config_path)
+            except Exception as e:
+                logger.info("No tq_config.json found for %s (%s), skipping TQ3 hook", model_config.model, e)
                 yield from _original_get_all_weights(self, model_config, model)
                 return
 
@@ -190,8 +193,19 @@ def _patch_weight_name_remapping():
         def _compress_prev_layer(layer_idx):
             """Compress a single decoder layer's weights on GPU."""
             nonlocal compressed_layers
-            layers = getattr(getattr(model, "model", None), "layers", None)
-            if layers is None or layer_idx >= len(layers):
+            # Navigate model → model.model.layers (Llama/DeepSeek/GLM pattern)
+            inner = getattr(model, "model", None)
+            layers = getattr(inner, "layers", None)
+            if layers is None:
+                if compressed_layers == 0:
+                    logger.warning(
+                        "Per-layer compression: model.model.layers not found "
+                        "(model type: %s, attrs: %s). Falling back to post-load compression.",
+                        type(model).__name__,
+                        [a for a in dir(model) if not a.startswith("_")][:10],
+                    )
+                return
+            if layer_idx >= len(layers):
                 return
             count = _replace_linear_layers(
                 layers[layer_idx], bits=bits, group_size=group_size,
@@ -263,3 +277,4 @@ def _patch_weight_name_remapping():
             logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
 
     DefaultModelLoader.get_all_weights = _decompress_get_all_weights
+    logger.info("TQ3 decompress-on-load hook installed on DefaultModelLoader.get_all_weights")
