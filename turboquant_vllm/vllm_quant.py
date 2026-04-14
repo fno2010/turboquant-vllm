@@ -93,16 +93,11 @@ def register():
                 return TurboQuantOnlineLinearMethod(self.bits, self.group_size)
             try:
                 from vllm.model_executor.layers.fused_moe import FusedMoE
-                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-                    UnquantizedFusedMoEMethod as _UnquantMoE,
-                )
 
-                if isinstance(layer, FusedMoE):
-                    # MoE stays unquantized for now — vLLM's modular
-                    # kernel system replaces custom quant methods, so
-                    # online compression doesn't survive init.
-                    # TODO: implement TQ3 MoE with supports_internal_mk
-                    return _UnquantMoE(layer.moe_config)
+                if isinstance(layer, FusedMoE) and TurboQuantOnlineMoEMethod is not None:
+                    return TurboQuantOnlineMoEMethod(
+                        self.bits, self.group_size, layer.moe_config,
+                    )
             except ImportError:
                 pass
             return None
@@ -356,6 +351,14 @@ def register():
                 # Point w13/w2 data at the shared scratch pool
                 layer.w13_weight.data = _shared_moe_scratch_pool.w13
                 layer.w2_weight.data = _shared_moe_scratch_pool.w2
+
+                # Init modular kernel BEFORE replacing quant method — this
+                # installs FusedMoEModularMethod (with a working kernel) as
+                # the current quant_method. Then _replace_quant_method stores
+                # it as base_quant_method, giving TurboQuantFusedMoEMethod a
+                # kernel-backed delegate for the actual MoE dispatch.
+                if hasattr(layer, "maybe_init_modular_kernel"):
+                    layer.maybe_init_modular_kernel()
 
                 new_method = TurboQuantFusedMoEMethod(
                     layer.moe_config, w13_c, w2_c, _shared_moe_scratch_pool,
