@@ -190,7 +190,11 @@ def register():
             packed = pack_indices(indices, bits)
             norms = norms_raw.reshape(out_dim, n_groups)
 
-            delattr(layer, "weight")
+            # Keep weight for vLLM's MLA/attention post-processing,
+            # but zero it to free most GPU memory. Full deletion breaks
+            # MLAAttention.process_weights_after_loading which accesses
+            # sub-layer weights after our quant method runs.
+            layer.weight.data = torch.empty(0, device=weight.device, dtype=weight.dtype)
             layer.register_buffer("tq_packed_weight", packed)
             layer.register_buffer("tq_norms", norms)
             layer.register_buffer("tq_signs1", quantizer.signs1)
