@@ -291,20 +291,7 @@ def register():
                     initialize_online_processing,
                 )
 
-                import sys
-                try:
-                    self._unquant.create_weights(layer, **kwargs)
-                    print(
-                        f"TQDEBUG create_weights OK: kernel={self._unquant.kernel}",
-                        file=sys.stderr, flush=True,
-                    )
-                except Exception as e:
-                    print(
-                        f"TQDEBUG create_weights FAILED: {e}",
-                        file=sys.stderr, flush=True,
-                    )
-                    # Fall back — create weights without kernel
-                    pass
+                self._unquant.create_weights(layer, **kwargs)
 
                 # Move parameters to meta device
                 for name, param in list(layer.named_parameters(recurse=False)):
@@ -336,6 +323,9 @@ def register():
 
                 bits = self.bits
                 group_size = self.group_size
+
+                # Let the unquantized method set up the MoE kernel FIRST
+                self._unquant.process_weights_after_loading(layer)
 
                 w13 = getattr(layer, "w13_weight", None)
                 w2 = getattr(layer, "w2_weight", None)
@@ -419,12 +409,8 @@ def register():
                 return self._unquant.get_fused_moe_quant_config(layer)
 
             def apply(self, layer: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
-                import sys
-                print(
-                    f"TQDEBUG apply: _unquant.kernel={self._unquant.kernel}, "
-                    f"layer.quant_method={type(layer.quant_method).__name__}",
-                    file=sys.stderr, flush=True,
-                )
+                # Decompression is handled by the _forward_method wrapper.
+                # Kernel was initialized by _unquant.process_weights_after_loading.
                 return self._unquant.apply(layer, x, **kwargs)
 
     except ImportError:
