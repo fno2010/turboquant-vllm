@@ -292,6 +292,10 @@ def register():
                 )
 
                 self._unquant.create_weights(layer, **kwargs)
+                logger.info(
+                    "MoE create_weights done, _unquant.kernel=%s",
+                    self._unquant.kernel,
+                )
 
                 # Move parameters to meta device
                 for name, param in list(layer.named_parameters(recurse=False)):
