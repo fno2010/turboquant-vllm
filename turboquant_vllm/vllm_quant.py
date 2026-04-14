@@ -93,11 +93,16 @@ def register():
                 return TurboQuantOnlineLinearMethod(self.bits, self.group_size)
             try:
                 from vllm.model_executor.layers.fused_moe import FusedMoE
+                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                    UnquantizedFusedMoEMethod as _UnquantMoE,
+                )
 
-                if isinstance(layer, FusedMoE) and TurboQuantOnlineMoEMethod is not None:
-                    return TurboQuantOnlineMoEMethod(
-                        self.bits, self.group_size, layer.moe_config,
-                    )
+                if isinstance(layer, FusedMoE):
+                    # MoE stays unquantized for now — vLLM's modular
+                    # kernel system replaces custom quant methods, so
+                    # online compression doesn't survive init.
+                    # TODO: implement TQ3 MoE with supports_internal_mk
+                    return _UnquantMoE(layer.moe_config)
             except ImportError:
                 pass
             return None
