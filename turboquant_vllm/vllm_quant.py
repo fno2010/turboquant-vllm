@@ -154,8 +154,9 @@ def register():
             initialize_online_processing(layer)
 
         def process_weights_after_loading(self, layer: nn.Module) -> None:
-            # Guard: called twice (online processing + global sweep)
-            if not hasattr(layer, "weight"):
+            # Guard: called twice (online processing + global sweep).
+            # After first call, weight is emptied; packed data is in tq_packed_weight.
+            if not hasattr(layer, "weight") or layer.weight.numel() == 0:
                 return
 
             from turboquant_vllm.weight_quant import (
