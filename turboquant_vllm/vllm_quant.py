@@ -349,11 +349,11 @@ def register():
                 layer.w13_weight.data = pool.w13
                 layer.w2_weight.data = pool.w2
 
-                # Wrap _forward_method to decompress TQ3 → scratch pool
-                # before each forward. FusedMoE is a CustomOp so its
-                # forward body is opaque to CUDA graph tracing — the
-                # decompression kernels are captured in the graph.
-                # Cache PolarQuant tensors for dynamo-safe decompression
+                # Init modular kernel so AOT compile sees a working
+                # MoE dispatch chain (FusedMoEModularMethod has kernel).
+                if hasattr(layer, "maybe_init_modular_kernel"):
+                    layer.maybe_init_modular_kernel()
+
                 from turboquant_vllm.weight_quant import _get_quantizer
 
                 _pq = _get_quantizer(group_size, bits, str(w13_c.packed.device))
