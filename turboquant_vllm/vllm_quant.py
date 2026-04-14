@@ -105,11 +105,13 @@ def register():
     # ── Online quant methods (meta-device init, per-layer compression) ──
 
     class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
-        """Load bf16 on meta device, compress to TQ3 per-layer after loading.
+        """Meta-device init + per-layer TQ3 compression for Linear layers.
 
-        Follows the same pattern as vLLM's online FP8 quantization:
-        allocate on meta device during model init (zero GPU memory),
-        materialize + compress one layer at a time during weight loading.
+        Allocates bf16 weight on meta device (zero GPU at init). After
+        weight loading materializes the bf16 on GPU, compress to TQ3
+        packed format. Single-pass decompression in get_all_weights
+        feeds bf16 to vLLM's standard weight routing (QKV stacking,
+        gate_up fusion) unchanged.
         """
 
         uses_meta_device: bool = True
@@ -156,6 +158,9 @@ def register():
                 _ensure_triton_backends,
                 _get_cuda_module,
                 _get_quantizer,
+                _tq_fused_gemm_fn,
+                _tq_fwht_input_fn,
+                _triton_available,
                 pack_indices,
                 padded_size,
             )
@@ -163,7 +168,6 @@ def register():
             weight = layer.weight.data
             bits = self.bits
             group_size = self.group_size
-            device = str(weight.device)
 
             out_dim, in_dim = weight.shape
             padded_in, n_groups = padded_size(in_dim, group_size)
@@ -177,7 +181,7 @@ def register():
                 padded = weight
 
             grouped = padded.reshape(-1, group_size)
-            quantizer = _get_quantizer(group_size, bits, device)
+            quantizer = _get_quantizer(group_size, bits, str(weight.device))
             indices, norms_raw = quantizer.quantize(grouped, norm_correction=True)
             packed = pack_indices(indices, bits)
             norms = norms_raw.reshape(out_dim, n_groups)
@@ -192,14 +196,9 @@ def register():
             layer.tq_out_features = out_dim
             layer.tq_padded_in = padded_in
 
-            # Cache dispatch functions — avoids per-forward cross-module lookups
+            # Cache dispatch — must run before CUDA graph capture
             _ensure_triton_backends()
             _get_cuda_module()
-            from turboquant_vllm.weight_quant import (
-                _tq_fused_gemm_fn,
-                _tq_fwht_input_fn,
-                _triton_available,
-            )
             if _triton_available:
                 layer._tq_primary_fn = (
                     _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
@@ -229,7 +228,7 @@ def register():
                         *args, group_size=self.group_size, bits=self.bits, bias=bias,
                     )
 
-            # CPU/CUDA fallback — dequantize then matmul
+            # CPU/CUDA fallback
             from turboquant_vllm.weight_quant import _get_quantizer, unpack_indices
 
             indices = unpack_indices(
@@ -365,15 +364,14 @@ def register():
 def _patch_weight_name_remapping():
     """Monkey-patch vLLM's weight iterator to decompress TQ3 weights on load.
 
-    When a native TQ3 checkpoint is loaded, the checkpoint contains
-    ``.tq_packed`` / ``.tq_norms`` tensor pairs instead of standard
-    ``.weight`` tensors.  This patch collects each pair, decompresses
-    to bf16 on CPU, and yields the result with the original weight name.
-    vLLM's model-specific weight loaders (stacked qkv, fused gate_up,
-    expert assembly) then work unchanged.
+    Single-pass: as each ``.tq_packed`` / ``.tq_norms`` pair arrives
+    from the checkpoint iterator, decompress to bf16 and yield with the
+    original ``.weight`` name.  vLLM's model-specific weight loaders
+    (stacked qkv, fused gate_up, expert assembly) work unchanged.
 
-    After loading, the runtime plugin re-compresses weights on GPU via
-    ``enable_weight_quantization`` — so the bf16 is transient.
+    CPU memory is bounded by the online processing buffer for currently-
+    loading modules (typically 1-2 decoder layers).  The bf16 is transient
+    — ``process_weights_after_loading`` compresses to TQ3 on GPU.
     """
     try:
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
@@ -385,20 +383,14 @@ def _patch_weight_name_remapping():
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
     def _decompress_get_all_weights(self, model_config, model):
-        """Decompress TQ3 → bf16, layer-by-layer to bound CPU memory.
+        """Decompress TQ3 → bf16 per tensor, single-pass.
 
-        Two-phase approach to avoid OOM on large MoE models:
-
-        Phase 1 — collect: iterate all checkpoint tensors. Non-TQ3
-        tensors (layernorms, embeddings) are yielded immediately.
-        TQ3 pairs (.tq_packed/.tq_norms) are collected as references
-        (mmap'd from safetensors, near-zero RSS).
-
-        Phase 2 — decompress by layer: sort collected TQ3 pairs by
-        decoder layer index, decompress one layer at a time. Online
-        processing completes each layer and frees its bf16 buffer
-        before the next layer is decompressed. Peak RSS: ~1 layer
-        bf16 instead of the full model.
+        Pairs ``.tq_packed`` + ``.tq_norms`` as they arrive from the
+        checkpoint iterator, decompresses to bf16 immediately, and yields
+        with the original ``.weight`` name. No collection / buffering of
+        packed tensors — CPU memory is bounded by whichever tensors the
+        online processing is currently accumulating for incomplete modules
+        (typically 1-2 decoder layers worth of bf16).
         """
         import os as _os
 
@@ -420,8 +412,6 @@ def _patch_weight_name_remapping():
                 return
 
         import json as _json
-        import re
-        from collections import defaultdict
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
@@ -429,80 +419,51 @@ def _patch_weight_name_remapping():
         group_size = tq_cfg.get("group_size", 128)
         logger.info(
             "TQ3 native checkpoint (bits=%d, group_size=%d): "
-            "two-phase layer-by-layer decompression",
+            "single-pass decompress-on-load",
             bits, group_size,
         )
 
-        # ── Phase 1: collect TQ3 pairs, yield non-TQ3 immediately ──
-        tq_pairs: dict[str, dict[str, torch.Tensor]] = {}
+        pending_packed: dict[str, torch.Tensor] = {}
+        pending_norms: dict[str, torch.Tensor] = {}
+        decompressed = 0
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
             if name.endswith(".weight.tq_packed"):
                 base = name[: -len(".tq_packed")]
-                tq_pairs.setdefault(base, {})["packed"] = tensor
+                pending_packed[base] = tensor
             elif name.endswith(".weight.tq_norms"):
                 base = name[: -len(".tq_norms")]
-                tq_pairs.setdefault(base, {})["norms"] = tensor
+                pending_norms[base] = tensor
             else:
                 yield name, tensor
+                continue
 
-        logger.info(
-            "Phase 1 complete: collected %d TQ3 pairs", len(tq_pairs),
-        )
+            # When both halves of a pair arrive, decompress and yield
+            if base in pending_packed and base in pending_norms:
+                packed = pending_packed.pop(base)
+                norms = pending_norms.pop(base)
 
-        # ── Phase 2: group by layer, decompress in order ──
-        layer_re = re.compile(r"model\.layers\.(\d+)\.")
-        by_layer: dict[int, list[tuple[str, dict]]] = defaultdict(list)
-        no_layer: list[tuple[str, dict]] = []
-
-        for base, data in tq_pairs.items():
-            m = layer_re.search(base)
-            if m:
-                by_layer[int(m.group(1))].append((base, data))
-            else:
-                no_layer.append((base, data))
-        del tq_pairs  # free dict; data dicts now only referenced from by_layer/no_layer
-
-        def _decompress_pair(base, data):
-            packed = data.get("packed")
-            norms = data.get("norms")
-            if packed is None or norms is None:
-                if packed is None:
-                    logger.warning("Missing .tq_packed for %s", base)
-                if norms is None:
-                    logger.warning("Missing .tq_norms for %s", base)
-                return None, None
-            n_rows = norms.shape[0]
-            n_groups = norms.shape[1]
-            in_dim = n_groups * group_size
-            comp = Compressed3D.from_packed(
-                packed, norms, (1, n_rows, in_dim),
-                torch.bfloat16, bits, group_size,
-            )
-            return base, comp.decompress().squeeze(0)
-
-        decompressed = 0
-        for layer_idx in sorted(by_layer.keys()):
-            for base, data in by_layer[layer_idx]:
-                name, w = _decompress_pair(base, data)
-                if w is not None:
-                    yield name, w
-                    decompressed += 1
-                    del w
-            # sorted() returned a snapshot list, safe to mutate during iteration
-            del by_layer[layer_idx]
-            if decompressed % 100 == 0 and decompressed > 0:
-                logger.info("  Decompressed %d tensors (layer %d)", decompressed, layer_idx)
-
-        # Non-layer tensors (embeddings, lm_head, etc.)
-        for base, data in no_layer:
-            name, w = _decompress_pair(base, data)
-            if w is not None:
-                yield name, w
+                n_rows = norms.shape[0]
+                n_groups = norms.shape[1]
+                in_dim = n_groups * group_size
+                comp = Compressed3D.from_packed(
+                    packed, norms, (1, n_rows, in_dim),
+                    torch.bfloat16, bits, group_size,
+                )
+                w = comp.decompress().squeeze(0)
                 decompressed += 1
-                del w
+                if decompressed % 200 == 0:
+                    logger.info("  Decompressed %d tensors", decompressed)
+                yield base, w
+                del packed, norms, comp, w
 
-        logger.info("TQ3 decompression complete: %d tensors", decompressed)
+        if decompressed > 0:
+            logger.info("TQ3 decompression complete: %d tensors", decompressed)
+
+        for base in pending_packed:
+            logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
+        for base in pending_norms:
+            logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
 
     DefaultModelLoader.get_all_weights = _decompress_get_all_weights
     logger.info("TQ3 decompress-on-load hook installed on DefaultModelLoader.get_all_weights")
