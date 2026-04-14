@@ -269,6 +269,12 @@ def register():
             UnquantizedFusedMoEMethod,
         )
 
+        # Shared scratch pool across all FusedMoE layers — only one MoE
+        # layer runs at a time during forward, so one set of bf16
+        # decompression buffers is enough. Per-layer pools would consume
+        # 78 × ~5 GB = 390 GB and defeat compression entirely.
+        _shared_moe_scratch_pool = None
+
         class TurboQuantOnlineMoEMethod(FusedMoEMethodBase):
             """Online TQ3 for FusedMoE: meta-device init + per-layer compression."""
 
@@ -308,13 +314,50 @@ def register():
                 initialize_online_processing(layer)
 
             def process_weights_after_loading(self, layer: nn.Module) -> None:
-                from turboquant_vllm.weight_quant import _replace_linear_layers
+                """Compress FusedMoE w13/w2 to TQ3, install TurboQuantFusedMoEMethod."""
+                nonlocal _shared_moe_scratch_pool
 
-                count = _replace_linear_layers(
-                    layer, bits=layer.tq_bits, group_size=layer.tq_group_size,
+                from turboquant_vllm.moe_quant import (
+                    TurboQuantFusedMoEMethod,
+                    TurboQuantFusedMoEScratchPool,
                 )
-                if count > 0:
-                    logger.info("TQ%d compressed %d MoE sub-layers", layer.tq_bits, count)
+                from turboquant_vllm.weight_quant import _compress_3d_param
+
+                bits = layer.tq_bits
+                group_size = layer.tq_group_size
+
+                w13 = getattr(layer, "w13_weight", None)
+                w2 = getattr(layer, "w2_weight", None)
+                if w13 is None or w2 is None or w13.dim() != 3 or w2.dim() != 3:
+                    logger.warning(
+                        "FusedMoE layer missing w13/w2 3D weights, skipping TQ3",
+                    )
+                    return
+
+                _compress_3d_param(layer, "w13_weight", bits, group_size)
+                _compress_3d_param(layer, "w2_weight", bits, group_size)
+
+                w13_c = layer._tq_w13_weight
+                w2_c = layer._tq_w2_weight
+
+                if _shared_moe_scratch_pool is None:
+                    _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(
+                        w13_c, w2_c,
+                    )
+                else:
+                    _shared_moe_scratch_pool.assert_matches(w13_c, w2_c)
+
+                # Point w13/w2 data at the shared scratch pool
+                layer.w13_weight.data = _shared_moe_scratch_pool.w13
+                layer.w2_weight.data = _shared_moe_scratch_pool.w2
+
+                new_method = TurboQuantFusedMoEMethod(
+                    layer.moe_config, w13_c, w2_c, _shared_moe_scratch_pool,
+                )
+                layer._replace_quant_method(new_method)
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             def get_fused_moe_quant_config(self, layer: nn.Module):
                 return self._unquant.get_fused_moe_quant_config(layer)
