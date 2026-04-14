@@ -292,9 +292,10 @@ def register():
                 )
 
                 self._unquant.create_weights(layer, **kwargs)
-                logger.info(
-                    "MoE create_weights done, _unquant.kernel=%s",
-                    self._unquant.kernel,
+                import sys
+                print(
+                    f"TQDEBUG create_weights: _unquant.kernel={self._unquant.kernel}",
+                    file=sys.stderr, flush=True,
                 )
 
                 # Move parameters to meta device
@@ -410,6 +411,12 @@ def register():
                 return self._unquant.get_fused_moe_quant_config(layer)
 
             def apply(self, layer: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
+                import sys
+                print(
+                    f"TQDEBUG apply: _unquant.kernel={self._unquant.kernel}, "
+                    f"layer.quant_method={type(layer.quant_method).__name__}",
+                    file=sys.stderr, flush=True,
+                )
                 return self._unquant.apply(layer, x, **kwargs)
 
     except ImportError:
