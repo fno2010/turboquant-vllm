@@ -154,6 +154,10 @@ def register():
             initialize_online_processing(layer)
 
         def process_weights_after_loading(self, layer: nn.Module) -> None:
+            # Guard: called twice (online processing + global sweep)
+            if not hasattr(layer, "weight"):
+                return
+
             from turboquant_vllm.weight_quant import (
                 _ensure_triton_backends,
                 _get_cuda_module,
@@ -303,6 +307,10 @@ def register():
                 initialize_online_processing(layer)
 
             def process_weights_after_loading(self, layer: nn.Module) -> None:
+                # Guard: called twice (online processing + global sweep)
+                if hasattr(layer, "_tq_w13_weight"):
+                    return
+
                 nonlocal _shared_moe_scratch_pool
 
                 from turboquant_vllm.moe_quant import (
