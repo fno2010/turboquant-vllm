@@ -249,8 +249,6 @@ def save_tq3_checkpoint(
 
     # Clean up temp download directory (only created in HF-download mode)
     if _tmp_download_dir is not None:
-        import shutil
-
         shutil.rmtree(_tmp_download_dir, ignore_errors=True)
 
     # Rename shards with correct total count
