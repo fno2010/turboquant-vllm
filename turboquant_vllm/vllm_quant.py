@@ -331,9 +331,20 @@ def register():
                         and getattr(_p.weight_loader, "__name__", "") == "online_process_loader"
                     )
                     import sys
+                    _all_tensors = {
+                        n: (t.device, t.numel())
+                        for n, t in _info.__class__.__mro__[0].__init__.__code__.co_varnames  # skip
+                    } if False else {}
+                    # List ALL params/buffers with numel and weight_loader status
+                    _param_info = []
+                    for _n, _p in layer.named_parameters(recurse=False):
+                        _has_wl = hasattr(_p, "weight_loader")
+                        _param_info.append(f"{_n}({_p.numel()},wl={_has_wl})")
+                    for _n, _b in layer.named_buffers(recurse=False):
+                        _param_info.append(f"buf:{_n}({_b.numel()})")
                     print(
                         f"[TQ-DEBUG] MoE init: total={_info.load_numel_total} "
-                        f"wrapped={_wrapped}",
+                        f"wrapped={_wrapped} all=[{', '.join(_param_info)}]",
                         file=sys.stderr, flush=True,
                     )
                 except Exception:
