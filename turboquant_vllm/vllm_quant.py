@@ -319,6 +319,26 @@ def register():
 
                 initialize_online_processing(layer)
 
+                # Debug: log online processing setup
+                try:
+                    from vllm.model_executor.model_loader.reload.layerwise import (
+                        get_layerwise_info,
+                    )
+                    _info = get_layerwise_info(layer)
+                    _wrapped = sum(
+                        1 for _n, _p in layer.named_parameters(recurse=False)
+                        if hasattr(_p, "weight_loader")
+                        and getattr(_p.weight_loader, "__name__", "") == "online_process_loader"
+                    )
+                    import sys
+                    print(
+                        f"[TQ-DEBUG] MoE init: total={_info.load_numel_total} "
+                        f"wrapped={_wrapped}",
+                        file=sys.stderr, flush=True,
+                    )
+                except Exception:
+                    pass
+
                 # Fix: CopyCounter doesn't count copy_() into meta tensors,
                 # so online processing never detects module completion.
                 # Patch each param's weight_loader to count from the loaded
@@ -365,7 +385,17 @@ def register():
                             # add our count from the loaded tensor
                             if counted == 0 and numel > 0:
                                 info.load_numel += numel
+                                import sys
+                                if info.load_numel % 50000000 < numel:
+                                    print(
+                                        f"[TQ-META] numel={info.load_numel}/{info.load_numel_total}",
+                                        file=sys.stderr, flush=True,
+                                    )
                                 if info.load_numel >= info.load_numel_total:
+                                    print(
+                                        f"[TQ-META] MODULE COMPLETE! Firing _layerwise_process",
+                                        file=sys.stderr, flush=True,
+                                    )
                                     _layerwise_process(layer, info)
                             return ret
                         return meta_aware_loader
@@ -375,6 +405,15 @@ def register():
             def process_weights_after_loading(self, layer: nn.Module) -> None:
                 if hasattr(layer, "_tq_w13_weight"):
                     return  # guard: called twice (online + global sweep)
+
+                import sys
+                print(
+                    f"[TQ-DEBUG] MoE process_weights: {layer.__class__.__name__} "
+                    f"w13={getattr(layer, 'w13_weight', None) is not None} "
+                    f"w13_device={getattr(layer.w13_weight, 'device', '?') if hasattr(layer, 'w13_weight') else '?'} "
+                    f"GPU={torch.cuda.memory_allocated()/1e9:.1f}GB",
+                    file=sys.stderr, flush=True,
+                )
 
                 nonlocal _shared_moe_scratch_pool
 
