@@ -151,6 +151,42 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             ratio = final_call.args[3]
             self.assertAlmostEqual(ratio, 40 / 32, places=6)
 
+    def test_local_path_copies_additional_json_configs(self):
+        """Extra local JSON config files should be preserved in output."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import save_file
+
+            save_file(
+                {"model.layers.0.mlp.fake.weight": torch.randn(8, 8)},
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump({"model_type": "bert", "vocab_size": 10}, f)
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+            custom_json = {"foo": "bar", "answer": 42}
+            with open(os.path.join(srcdir, "custom_config.json"), "w") as f:
+                json.dump(custom_json, f)
+
+            save_tq3_checkpoint(
+                model_id=srcdir,
+                output_dir=outdir,
+                bits=3,
+                group_size=8,
+            )
+
+            copied_path = os.path.join(outdir, "custom_config.json")
+            self.assertTrue(os.path.exists(copied_path), "Expected custom local JSON config to be copied")
+            with open(copied_path) as f:
+                self.assertEqual(json.load(f), custom_json)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

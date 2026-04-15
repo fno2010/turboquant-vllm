@@ -26,6 +26,7 @@ Usage:
 import json
 import logging
 import os
+import shutil
 import torch
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ def save_tq3_checkpoint(
         logger.info("Using local checkpoint at %s", model_id)
     else:
         logger.info("Downloading config and tokenizer for %s...", model_id)
+    logger.info("Saving config and tokenizer to %s", output_dir)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Do NOT inject quantization_config into config.json — vLLM
@@ -111,6 +113,19 @@ def save_tq3_checkpoint(
         config.quantization_config = None
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    if is_local:
+        copied_json = 0
+        for filename in sorted(os.listdir(model_id)):
+            if not filename.endswith(".json"):
+                continue
+            src = os.path.join(model_id, filename)
+            dst = os.path.join(output_dir, filename)
+            if not os.path.isfile(src) or os.path.exists(dst):
+                continue
+            shutil.copy2(src, dst)
+            copied_json += 1
+            logger.info("Copied local config JSON: %s", filename)
+        logger.info("Copied %d additional local JSON config file(s)", copied_json)
 
     if is_local:
         shard_files = sorted(f for f in os.listdir(model_id) if f.endswith(".safetensors"))
