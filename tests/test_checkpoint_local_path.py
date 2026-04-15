@@ -24,6 +24,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class TestSaveTqCheckpointLocalPath(unittest.TestCase):
+    def test_remote_repo_missing_shards_raises(self):
+        """Remote repos with no safetensors shards should fail with a clear error."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        dummy = mock.Mock()
+        dummy.save_pretrained = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as outdir:
+            with (
+                mock.patch("transformers.AutoConfig.from_pretrained", return_value=dummy),
+                mock.patch("transformers.AutoTokenizer.from_pretrained", return_value=dummy),
+                mock.patch("huggingface_hub.HfApi.list_repo_files", return_value=[]),
+            ):
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    save_tq3_checkpoint(
+                        model_id="fake-org/fake-model",
+                        output_dir=outdir,
+                        bits=3,
+                        group_size=8,
+                    )
+        self.assertIn("No .safetensors shards", str(ctx.exception))
+
     def test_local_path_does_not_touch_hf_hub(self):
         """Pass a local dir and verify HF Hub is not touched and local source shards are not deleted."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint

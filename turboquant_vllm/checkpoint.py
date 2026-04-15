@@ -137,6 +137,8 @@ def save_tq3_checkpoint(
         api = HfApi()
         repo_files = api.list_repo_files(model_id)
         shard_files = sorted(f for f in repo_files if f.endswith(".safetensors"))
+        if not shard_files:
+            raise FileNotFoundError(f"No .safetensors shards found in HuggingFace repo {model_id}")
 
     from turboquant_vllm.weight_quant import select_bits, _SENSITIVE_PATTERNS
 
