@@ -350,8 +350,29 @@ def register():
                 except Exception:
                     pass
 
-                # No weight_loader wrapping — causes recursion with
-                # get_numel_loaded. Just log the setup state.
+                # Patch get_numel_loaded to log counting for this layer
+                from vllm.model_executor.model_loader.reload import layerwise as _lw
+                from vllm.model_executor.model_loader.reload import meta as _meta
+
+                if not hasattr(_meta, "_tq_patched"):
+                    _orig_gnl = _meta.get_numel_loaded
+                    _gnl_count = [0]
+
+                    def _logged_gnl(weight_loader, args):
+                        result = _orig_gnl(weight_loader, args)
+                        _gnl_count[0] += 1
+                        if _gnl_count[0] <= 5 or _gnl_count[0] % 500 == 0:
+                            import sys
+                            print(
+                                f"[TQ-GNL] #{_gnl_count[0]} numel_returned={result[0]}",
+                                file=sys.stderr, flush=True,
+                            )
+                        return result
+
+                    _meta.get_numel_loaded = _logged_gnl
+                    # Also patch the reference in layerwise module
+                    _lw.get_numel_loaded = _logged_gnl
+                    _meta._tq_patched = True
 
             def process_weights_after_loading(self, layer: nn.Module) -> None:
                 if hasattr(layer, "_tq_w13_weight"):
