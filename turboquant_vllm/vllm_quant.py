@@ -434,6 +434,15 @@ def register():
                         buffer.append((param_name, args, kwargs))
                         loaded_numel[0] += numel
 
+                        if len(buffer) <= 3 or len(buffer) % 200 == 0:
+                            import sys
+
+                            print(
+                                f"[TQ-BUF] #{len(buffer)} numel={loaded_numel[0]}/{total_numel} "
+                                f"pname={param_name}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                         if loaded_numel[0] >= total_numel:
                             materialized[0] = True
                             _materialize_and_process(
@@ -444,8 +453,6 @@ def register():
                                 param_dtypes,
                                 self,
                             )
-                        # Return True so callers with return_success=True
-                        # don't think the load failed
                         return True
 
                     return _buffering_loader
