@@ -294,8 +294,6 @@ def register():
             method,
         ):
             """Materialize meta params on GPU, replay buffered loads, compress."""
-            import sys
-
             # 1. Materialize meta → real tensors on GPU
             for name, param in list(layer.named_parameters(recurse=False)):
                 if param.device == torch.device("meta") and name in param_shapes:
@@ -305,7 +303,6 @@ def register():
                         device="cuda",
                     )
                     real_param = torch.nn.Parameter(real, requires_grad=False)
-                    # Preserve weight_loader for replay
                     if name in orig_loaders:
                         real_param.weight_loader = orig_loaders[name]
                     for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor", "is_metadata"):
@@ -315,50 +312,16 @@ def register():
                     layer.register_parameter(name, real_param)
 
             # 2. Replay all buffered weight_loader calls
-            replay_ok = 0
-            replay_fail = 0
             for pname, args, kwargs in buffer:
                 loader = orig_loaders.get(pname)
                 if loader is not None:
                     param = getattr(layer, pname)
                     new_args = (param,) + args[1:]
-                    try:
-                        loader(*new_args, **kwargs)
-                        replay_ok += 1
-                    except Exception as e:
-                        replay_fail += 1
-                        if replay_fail <= 3:
-                            print(
-                                f"[TQ-REPLAY] FAIL #{replay_fail}: {pname} "
-                                f"args_types={[type(a).__name__ for a in new_args]} "
-                                f"kwargs={list(kwargs.keys())} err={e}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-
-            # Check if data actually landed
-            for pname in ["w13_weight", "w2_weight"]:
-                p = getattr(layer, pname, None)
-                if p is not None:
-                    nonzero = (p.data != 0).any().item() if p.numel() > 0 else False
-                    print(
-                        f"[TQ-REPLAY] {pname}: shape={tuple(p.shape)} "
-                        f"device={p.device} nonzero={nonzero} "
-                        f"ok={replay_ok} fail={replay_fail}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    loader(*new_args, **kwargs)
             buffer.clear()
 
-            # 3. Run process_weights_after_loading (kernel setup + compress)
+            # 3. Kernel setup + compress
             method._do_compress(layer)
-
-            gpu_gb = torch.cuda.memory_allocated() / 1e9
-            print(
-                f"[TQ-MOE] Module materialized+compressed GPU={gpu_gb:.1f}GB",
-                file=sys.stderr,
-                flush=True,
-            )
 
         # Shared scratch pool across all FusedMoE layers — only one MoE
         # layer runs at a time during forward, so one set of bf16
@@ -418,10 +381,10 @@ def register():
                         layer.register_parameter(name, meta_param)
 
                 # Custom per-module buffering — bypass initialize_online_processing.
-                # vLLM's CopyCounter may not count copy_() into meta tensors
-                # correctly, preventing module completion. We track loaded
-                # numel directly from each weight_loader call.
-                buffer = []  # [(param_name, args, kwargs, numel)]
+                # vLLM's online processing (CopyCounter) doesn't reliably
+                # complete FusedMoE modules on meta device. We track loaded
+                # numel directly from each weight_loader call instead.
+                buffer: list[tuple[str, tuple, dict]] = []
                 loaded_numel = [0]
                 materialized = [False]
 
@@ -433,16 +396,6 @@ def register():
                         numel = loaded_weight.numel() if isinstance(loaded_weight, torch.Tensor) else 0
                         buffer.append((param_name, args, kwargs))
                         loaded_numel[0] += numel
-
-                        if len(buffer) <= 3 or len(buffer) % 200 == 0:
-                            import sys
-
-                            print(
-                                f"[TQ-BUF] #{len(buffer)} numel={loaded_numel[0]}/{total_numel} "
-                                f"pname={param_name}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
                         if loaded_numel[0] >= total_numel:
                             materialized[0] = True
                             _materialize_and_process(
@@ -453,6 +406,7 @@ def register():
                                 param_dtypes,
                                 self,
                             )
+                        # Signal success so model.load_weights commits the expert
                         return True
 
                     return _buffering_loader
