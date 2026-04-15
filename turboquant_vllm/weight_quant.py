@@ -551,9 +551,7 @@ class Compressed3D:
         obj.compressed_bytes = packed.numel() + norms.numel() * 4
         return obj
 
-    def decompress_into(
-        self, out: torch.Tensor, fp32_scratch: torch.Tensor | None = None
-    ) -> None:
+    def decompress_into(self, out: torch.Tensor, fp32_scratch: torch.Tensor | None = None) -> None:
         """Write decompressed weights into a pre-allocated ``out`` buffer.
 
         ``out`` must have ``shape == self.shape`` and ``dtype == self.dtype``,
@@ -568,12 +566,8 @@ class Compressed3D:
         allocation is baked into the replayed graph). If None, a fresh
         fp32 buffer is allocated per call.
         """
-        assert out.shape == self.shape, (
-            f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
-        )
-        assert out.dtype == self.dtype, (
-            f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
-        )
+        assert out.shape == self.shape, f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
+        assert out.dtype == self.dtype, f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
         assert out.device == self.packed.device, (
             f"decompress_into expected device {self.packed.device}, got {out.device}"
         )
@@ -593,9 +587,7 @@ class Compressed3D:
             assert fp32_scratch.device == self.packed.device
             target = fp32_scratch
         else:
-            target = torch.empty(
-                self.shape, dtype=kernel_dtype, device=self.packed.device
-            )
+            target = torch.empty(self.shape, dtype=kernel_dtype, device=self.packed.device)
 
         quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
         cuda_mod.weight_dequant_3d(
@@ -682,9 +674,7 @@ class Compressed3D:
         return self.original_bytes / self.compressed_bytes if self.compressed_bytes > 0 else 0
 
 
-def _compress_3d_param(
-    module: nn.Module, param_name: str, bits: int, group_size: int
-) -> tuple[int, int]:
+def _compress_3d_param(module: nn.Module, param_name: str, bits: int, group_size: int) -> tuple[int, int]:
     """Compress a 3D parameter in-place with real memory savings.
 
     Stores the :class:`Compressed3D` as ``module._tq_{param_name}`` and
@@ -1002,11 +992,7 @@ def _replace_linear_layers(
 
     moe_scratch_pool = None
 
-    if (
-        FusedMoE is not None
-        and TurboQuantFusedMoEMethod is not None
-        and TurboQuantFusedMoEScratchPool is not None
-    ):
+    if FusedMoE is not None and TurboQuantFusedMoEMethod is not None and TurboQuantFusedMoEScratchPool is not None:
         for name, module in list(model.named_modules()):
             if not isinstance(module, FusedMoE):
                 continue
@@ -1027,8 +1013,7 @@ def _replace_linear_layers(
                 continue
             if w13_param.dim() != 3 or w2_param.dim() != 3:
                 logger.warning(
-                    "FusedMoE at %s has unexpected weight rank "
-                    "(w13=%d, w2=%d) — skipping",
+                    "FusedMoE at %s has unexpected weight rank (w13=%d, w2=%d) — skipping",
                     name,
                     w13_param.dim(),
                     w2_param.dim(),
@@ -1078,9 +1063,7 @@ def _replace_linear_layers(
             # Swap the FusedMoE quant method. _replace_quant_method both
             # updates self.quant_method AND re-inits the runner so the
             # runner's captured reference points at our new method.
-            new_method = TurboQuantFusedMoEMethod(
-                module.moe_config, w13_c, w2_c, moe_scratch_pool
-            )
+            new_method = TurboQuantFusedMoEMethod(module.moe_config, w13_c, w2_c, moe_scratch_pool)
             module._replace_quant_method(new_method)
             _moe_compressed_count += 1
 

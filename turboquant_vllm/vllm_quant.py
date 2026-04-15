@@ -88,9 +88,7 @@ def register():
             sensitive_bits = cls.get_from_keys_or(config, ["sensitive_bits"], None)
             return cls(bits=bits, group_size=group_size, sensitive_bits=sensitive_bits)
 
-        def get_quant_method(
-            self, layer: nn.Module, prefix: str
-        ) -> "QuantizeMethodBase | None":
+        def get_quant_method(self, layer: nn.Module, prefix: str) -> "QuantizeMethodBase | None":
             if isinstance(layer, LinearBase):
                 return TurboQuantOnlineLinearMethod(self.bits, self.group_size)
             try:
@@ -98,7 +96,9 @@ def register():
 
                 if isinstance(layer, FusedMoE) and TurboQuantOnlineMoEMethod is not None:
                     return TurboQuantOnlineMoEMethod(
-                        self.bits, self.group_size, layer.moe_config,
+                        self.bits,
+                        self.group_size,
+                        layer.moe_config,
                     )
             except ImportError:
                 pass
@@ -181,7 +181,10 @@ def register():
 
             if padded_in > in_dim:
                 padded = torch.zeros(
-                    out_dim, padded_in, dtype=weight.dtype, device=weight.device,
+                    out_dim,
+                    padded_in,
+                    dtype=weight.dtype,
+                    device=weight.device,
                 )
                 padded[:, :in_dim] = weight
             else:
@@ -211,47 +214,61 @@ def register():
             _ensure_triton_backends()
             _get_cuda_module()
             if _triton_available:
-                layer._tq_primary_fn = (
-                    _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
-                )
-                layer._tq_fallback_fn = (
-                    _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
-                )
+                layer._tq_primary_fn = _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
+                layer._tq_fallback_fn = _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
             else:
                 layer._tq_primary_fn = None
 
             del weight, padded, grouped, indices, norms_raw
 
         def apply(
-            self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None,
+            self,
+            layer: nn.Module,
+            x: torch.Tensor,
+            bias: torch.Tensor | None = None,
         ) -> torch.Tensor:
             if layer._tq_primary_fn is not None:
                 args = (
-                    x, layer.tq_packed_weight, layer.tq_norms,
-                    layer.tq_signs1, layer.tq_signs2, layer.tq_centroids,
+                    x,
+                    layer.tq_packed_weight,
+                    layer.tq_norms,
+                    layer.tq_signs1,
+                    layer.tq_signs2,
+                    layer.tq_centroids,
                 )
                 try:
                     return layer._tq_primary_fn(
-                        *args, group_size=self.group_size, bits=self.bits, bias=bias,
+                        *args,
+                        group_size=self.group_size,
+                        bits=self.bits,
+                        bias=bias,
                     )
                 except (ValueError, RuntimeError):
                     return layer._tq_fallback_fn(
-                        *args, group_size=self.group_size, bits=self.bits, bias=bias,
+                        *args,
+                        group_size=self.group_size,
+                        bits=self.bits,
+                        bias=bias,
                     )
 
             # CPU/CUDA fallback
             from turboquant_vllm.weight_quant import _get_quantizer, unpack_indices
 
             indices = unpack_indices(
-                layer.tq_packed_weight, self.bits, self.group_size,
+                layer.tq_packed_weight,
+                self.bits,
+                self.group_size,
             )
             norms_flat = layer.tq_norms.reshape(-1)
             quantizer = _get_quantizer(
-                self.group_size, self.bits, str(x.device),
+                self.group_size,
+                self.bits,
+                str(x.device),
             )
             w_groups = quantizer.dequantize(indices, norms_flat)
             w_deq = w_groups.reshape(
-                layer.tq_out_features, layer.tq_padded_in,
+                layer.tq_out_features,
+                layer.tq_padded_in,
             )[:, : layer.tq_in_features].to(x.dtype)
             output = torch.matmul(x, w_deq.t())
             if bias is not None:
@@ -269,7 +286,12 @@ def register():
         )
 
         def _materialize_and_process(
-            layer, buffer, orig_loaders, param_shapes, param_dtypes, method,
+            layer,
+            buffer,
+            orig_loaders,
+            param_shapes,
+            param_dtypes,
+            method,
         ):
             """Materialize meta params on GPU, replay buffered loads, compress."""
             import sys
@@ -278,15 +300,15 @@ def register():
             for name, param in list(layer.named_parameters(recurse=False)):
                 if param.device == torch.device("meta") and name in param_shapes:
                     real = torch.empty(
-                        param_shapes[name], dtype=param_dtypes[name],
+                        param_shapes[name],
+                        dtype=param_dtypes[name],
                         device="cuda",
                     )
                     real_param = torch.nn.Parameter(real, requires_grad=False)
                     # Preserve weight_loader for replay
                     if name in orig_loaders:
                         real_param.weight_loader = orig_loaders[name]
-                    for attr in ("output_dim", "input_dim", "packed_dim",
-                                 "packed_factor", "is_metadata"):
+                    for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor", "is_metadata"):
                         if hasattr(param, attr):
                             setattr(real_param, attr, getattr(param, attr))
                     delattr(layer, name)
@@ -310,7 +332,8 @@ def register():
                                 f"[TQ-REPLAY] FAIL #{replay_fail}: {pname} "
                                 f"args_types={[type(a).__name__ for a in new_args]} "
                                 f"kwargs={list(kwargs.keys())} err={e}",
-                                file=sys.stderr, flush=True,
+                                file=sys.stderr,
+                                flush=True,
                             )
 
             # Check if data actually landed
@@ -322,7 +345,8 @@ def register():
                         f"[TQ-REPLAY] {pname}: shape={tuple(p.shape)} "
                         f"device={p.device} nonzero={nonzero} "
                         f"ok={replay_ok} fail={replay_fail}",
-                        file=sys.stderr, flush=True,
+                        file=sys.stderr,
+                        flush=True,
                     )
             buffer.clear()
 
@@ -332,7 +356,8 @@ def register():
             gpu_gb = torch.cuda.memory_allocated() / 1e9
             print(
                 f"[TQ-MOE] Module materialized+compressed GPU={gpu_gb:.1f}GB",
-                file=sys.stderr, flush=True,
+                file=sys.stderr,
+                flush=True,
             )
 
         # Shared scratch pool across all FusedMoE layers — only one MoE
@@ -365,9 +390,7 @@ def register():
                 self._unquant.create_weights(layer, **kwargs)
 
                 # Compute expected total numel for completion tracking
-                total_numel = sum(
-                    p.numel() for p in layer.parameters(recurse=False)
-                )
+                total_numel = sum(p.numel() for p in layer.parameters(recurse=False))
 
                 # Save original weight_loaders + shapes BEFORE meta move
                 orig_loaders: dict[str, Any] = {}
@@ -388,8 +411,7 @@ def register():
                         )
                         if hasattr(param, "weight_loader"):
                             meta_param.weight_loader = param.weight_loader
-                        for attr in ("output_dim", "input_dim", "packed_dim",
-                                     "packed_factor", "is_metadata"):
+                        for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor", "is_metadata"):
                             if hasattr(param, attr):
                                 setattr(meta_param, attr, getattr(param, attr))
                         delattr(layer, name)
@@ -408,29 +430,31 @@ def register():
                         if materialized[0]:
                             return orig_loader(*args, **kwargs)
                         loaded_weight = args[1] if len(args) > 1 else None
-                        numel = (
-                            loaded_weight.numel()
-                            if isinstance(loaded_weight, torch.Tensor)
-                            else 0
-                        )
+                        numel = loaded_weight.numel() if isinstance(loaded_weight, torch.Tensor) else 0
                         buffer.append((param_name, args, kwargs))
                         loaded_numel[0] += numel
 
                         if loaded_numel[0] >= total_numel:
                             materialized[0] = True
                             _materialize_and_process(
-                                layer, buffer, orig_loaders,
-                                param_shapes, param_dtypes, self,
+                                layer,
+                                buffer,
+                                orig_loaders,
+                                param_shapes,
+                                param_dtypes,
+                                self,
                             )
                         # Return True so callers with return_success=True
                         # don't think the load failed
                         return True
+
                     return _buffering_loader
 
                 for pname, param in layer.named_parameters(recurse=False):
                     if pname in orig_loaders:
                         param.weight_loader = _make_buffering_loader(
-                            pname, orig_loaders[pname],
+                            pname,
+                            orig_loaders[pname],
                         )
 
             def _do_compress(self, layer: nn.Module) -> None:
@@ -455,11 +479,13 @@ def register():
 
                 if _shared_moe_scratch_pool is None:
                     _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(
-                        self._w13_c, self._w2_c,
+                        self._w13_c,
+                        self._w2_c,
                     )
                 else:
                     _shared_moe_scratch_pool.assert_matches(
-                        self._w13_c, self._w2_c,
+                        self._w13_c,
+                        self._w2_c,
                     )
 
                 self._pool = _shared_moe_scratch_pool
@@ -486,10 +512,12 @@ def register():
                 # the unquantized method which has the MoE kernel.
                 if self._pool is not None and self._w13_c is not None:
                     self._w13_c.decompress_into(
-                        self._pool.w13, fp32_scratch=self._pool.w13_fp32,
+                        self._pool.w13,
+                        fp32_scratch=self._pool.w13_fp32,
                     )
                     self._w2_c.decompress_into(
-                        self._pool.w2, fp32_scratch=self._pool.w2_fp32,
+                        self._pool.w2,
+                        fp32_scratch=self._pool.w2_fp32,
                     )
                 return self._unquant.apply(layer, x, **kwargs)
 
@@ -541,12 +569,15 @@ def _patch_weight_name_remapping():
 
                 revision = getattr(model_config, "revision", None)
                 tq_config_path = hf_hub_download(
-                    model_config.model, "tq_config.json", revision=revision,
+                    model_config.model,
+                    "tq_config.json",
+                    revision=revision,
                 )
             except Exception as e:
                 logger.info(
                     "No tq_config.json for %s (%s), passing through",
-                    model_config.model, e,
+                    model_config.model,
+                    e,
                 )
                 yield from _original_get_all_weights(self, model_config, model)
                 return
@@ -558,9 +589,9 @@ def _patch_weight_name_remapping():
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
         logger.info(
-            "TQ3 native checkpoint (bits=%d, group_size=%d): "
-            "single-pass decompress-on-load",
-            bits, group_size,
+            "TQ3 native checkpoint (bits=%d, group_size=%d): single-pass decompress-on-load",
+            bits,
+            group_size,
         )
 
         pending_packed: dict[str, torch.Tensor] = {}
@@ -587,8 +618,12 @@ def _patch_weight_name_remapping():
                 n_groups = norms.shape[1]
                 in_dim = n_groups * group_size
                 comp = Compressed3D.from_packed(
-                    packed, norms, (1, n_rows, in_dim),
-                    torch.bfloat16, bits, group_size,
+                    packed,
+                    norms,
+                    (1, n_rows, in_dim),
+                    torch.bfloat16,
+                    bits,
+                    group_size,
                 )
                 w = comp.decompress().squeeze(0)
                 decompressed += 1

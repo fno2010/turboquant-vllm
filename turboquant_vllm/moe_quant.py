@@ -85,6 +85,7 @@ class TurboQuantFusedMoEScratchPool:
 if _HAS_FUSED_MOE:
     _register_custom_op = CustomOp.register("turboquant_fused_moe")
 else:
+
     def _register_custom_op(cls):
         return cls
 
@@ -114,8 +115,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ):
         if not _HAS_FUSED_MOE:
             raise RuntimeError(
-                "TurboQuantFusedMoEMethod requires vllm.model_executor.layers."
-                "fused_moe — import failed at module load."
+                "TurboQuantFusedMoEMethod requires vllm.model_executor.layers.fused_moe — import failed at module load."
             )
         # Both bases must be initialized: FusedMoEMethodBase needs
         # moe_config; CustomOp needs to set up its nn.Module state.
