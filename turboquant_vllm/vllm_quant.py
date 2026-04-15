@@ -427,6 +427,17 @@ def register():
                 _compress_3d_param(layer, "w13_weight", self.bits, self.group_size)
                 _compress_3d_param(layer, "w2_weight", self.bits, self.group_size)
 
+                # Check for CUDA errors from compression
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    import sys
+                    print(
+                        f"[TQ-MOE] Compressed OK, "
+                        f"w13_c={layer._tq_w13_weight.packed.shape} "
+                        f"w2_c={layer._tq_w2_weight.packed.shape}",
+                        file=sys.stderr, flush=True,
+                    )
+
                 self._w13_c = layer._tq_w13_weight
                 self._w2_c = layer._tq_w2_weight
 

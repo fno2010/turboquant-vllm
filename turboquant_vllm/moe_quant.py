@@ -54,10 +54,10 @@ class TurboQuantFusedMoEScratchPool:
     def __init__(self, w13_compressed, w2_compressed):
         device = w13_compressed.packed.device
         bf16_dtype = w13_compressed.dtype
-        self.w13 = torch.empty(w13_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w2 = torch.empty(w2_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w13_fp32 = torch.empty(w13_compressed.shape, dtype=torch.float32, device=device)
-        self.w2_fp32 = torch.empty(w2_compressed.shape, dtype=torch.float32, device=device)
+        self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=device)
+        self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=device)
+        self.w13_fp32 = torch.zeros(w13_compressed.shape, dtype=torch.float32, device=device)
+        self.w2_fp32 = torch.zeros(w2_compressed.shape, dtype=torch.float32, device=device)
         self.shape_w13 = w13_compressed.shape
         self.shape_w2 = w2_compressed.shape
 
