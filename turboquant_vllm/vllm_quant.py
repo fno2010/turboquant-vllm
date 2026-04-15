@@ -268,6 +268,49 @@ def register():
             UnquantizedFusedMoEMethod,
         )
 
+        def _materialize_and_process(
+            layer, buffer, orig_loaders, param_shapes, param_dtypes, method,
+        ):
+            """Materialize meta params on GPU, replay buffered loads, compress."""
+            import sys
+
+            # 1. Materialize meta → real tensors on GPU
+            for name, param in list(layer.named_parameters(recurse=False)):
+                if param.device == torch.device("meta") and name in param_shapes:
+                    real = torch.empty(
+                        param_shapes[name], dtype=param_dtypes[name],
+                        device="cuda",
+                    )
+                    real_param = torch.nn.Parameter(real, requires_grad=False)
+                    # Preserve weight_loader for replay
+                    if name in orig_loaders:
+                        real_param.weight_loader = orig_loaders[name]
+                    for attr in ("output_dim", "input_dim", "packed_dim",
+                                 "packed_factor", "is_metadata"):
+                        if hasattr(param, attr):
+                            setattr(real_param, attr, getattr(param, attr))
+                    delattr(layer, name)
+                    layer.register_parameter(name, real_param)
+
+            # 2. Replay all buffered weight_loader calls
+            for pname, args, kwargs in buffer:
+                loader = orig_loaders.get(pname)
+                if loader is not None:
+                    # Update the param reference in args
+                    param = getattr(layer, pname)
+                    new_args = (param,) + args[1:]
+                    loader(*new_args, **kwargs)
+            buffer.clear()
+
+            # 3. Run process_weights_after_loading (kernel setup + compress)
+            method._do_compress(layer)
+
+            gpu_gb = torch.cuda.memory_allocated() / 1e9
+            print(
+                f"[TQ-MOE] Module materialized+compressed GPU={gpu_gb:.1f}GB",
+                file=sys.stderr, flush=True,
+            )
+
         # Shared scratch pool across all FusedMoE layers — only one MoE
         # layer runs at a time during forward, so one set of bf16
         # decompression buffers is enough. Per-layer pools would consume
@@ -295,11 +338,22 @@ def register():
                 self._w2_c = None
 
             def create_weights(self, layer: nn.Module, **kwargs):
-                from vllm.model_executor.model_loader.reload.layerwise import (
-                    initialize_online_processing,
+                self._unquant.create_weights(layer, **kwargs)
+
+                # Compute expected total numel for completion tracking
+                total_numel = sum(
+                    p.numel() for p in layer.parameters(recurse=False)
                 )
 
-                self._unquant.create_weights(layer, **kwargs)
+                # Save original weight_loaders + shapes BEFORE meta move
+                orig_loaders: dict[str, Any] = {}
+                param_shapes: dict[str, tuple] = {}
+                param_dtypes: dict[str, torch.dtype] = {}
+                for name, param in list(layer.named_parameters(recurse=False)):
+                    if hasattr(param, "weight_loader"):
+                        orig_loaders[name] = param.weight_loader
+                    param_shapes[name] = tuple(param.shape)
+                    param_dtypes[name] = param.dtype
 
                 # Move parameters to meta device (zero GPU at init)
                 for name, param in list(layer.named_parameters(recurse=False)):
@@ -317,76 +371,46 @@ def register():
                         delattr(layer, name)
                         layer.register_parameter(name, meta_param)
 
-                initialize_online_processing(layer)
+                # Custom per-module buffering — bypass initialize_online_processing.
+                # vLLM's CopyCounter may not count copy_() into meta tensors
+                # correctly, preventing module completion. We track loaded
+                # numel directly from each weight_loader call.
+                buffer = []  # [(param_name, args, kwargs, numel)]
+                loaded_numel = [0]
+                materialized = [False]
 
-                # Debug: log online processing setup
-                try:
-                    from vllm.model_executor.model_loader.reload.layerwise import (
-                        get_layerwise_info,
-                    )
-                    _info = get_layerwise_info(layer)
-                    _wrapped = sum(
-                        1 for _n, _p in layer.named_parameters(recurse=False)
-                        if hasattr(_p, "weight_loader")
-                        and getattr(_p.weight_loader, "__name__", "") == "online_process_loader"
-                    )
-                    import sys
-                    _all_tensors = {
-                        n: (t.device, t.numel())
-                        for n, t in _info.__class__.__mro__[0].__init__.__code__.co_varnames  # skip
-                    } if False else {}
-                    # List ALL params/buffers with numel and weight_loader status
-                    _param_info = []
-                    for _n, _p in layer.named_parameters(recurse=False):
-                        _has_wl = hasattr(_p, "weight_loader")
-                        _param_info.append(f"{_n}({_p.numel()},wl={_has_wl})")
-                    for _n, _b in layer.named_buffers(recurse=False):
-                        _param_info.append(f"buf:{_n}({_b.numel()})")
-                    print(
-                        f"[TQ-DEBUG] MoE init: total={_info.load_numel_total} "
-                        f"wrapped={_wrapped} all=[{', '.join(_param_info)}]",
-                        file=sys.stderr, flush=True,
-                    )
-                except Exception:
-                    pass
+                def _make_buffering_loader(param_name, orig_loader):
+                    def _buffering_loader(*args, **kwargs):
+                        if materialized[0]:
+                            # After materialization, run directly
+                            return orig_loader(*args, **kwargs)
+                        # Buffer the call + track loaded numel
+                        loaded_weight = args[1] if len(args) > 1 else None
+                        numel = (
+                            loaded_weight.numel()
+                            if isinstance(loaded_weight, torch.Tensor)
+                            else 0
+                        )
+                        buffer.append((param_name, args, kwargs))
+                        loaded_numel[0] += numel
 
-                # Patch get_numel_loaded to log counting for this layer
-                from vllm.model_executor.model_loader.reload import layerwise as _lw
-                from vllm.model_executor.model_loader.reload import meta as _meta
-
-                if not hasattr(_meta, "_tq_patched"):
-                    _orig_gnl = _meta.get_numel_loaded
-                    _gnl_count = [0]
-
-                    def _logged_gnl(weight_loader, args):
-                        result = _orig_gnl(weight_loader, args)
-                        _gnl_count[0] += 1
-                        if _gnl_count[0] <= 5 or _gnl_count[0] % 500 == 0:
-                            import sys
-                            print(
-                                f"[TQ-GNL] #{_gnl_count[0]} numel_returned={result[0]}",
-                                file=sys.stderr, flush=True,
+                        if loaded_numel[0] >= total_numel:
+                            # All weights arrived — materialize + replay
+                            materialized[0] = True
+                            _materialize_and_process(
+                                layer, buffer, orig_loaders,
+                                param_shapes, param_dtypes, self,
                             )
-                        return result
+                    return _buffering_loader
 
-                    _meta.get_numel_loaded = _logged_gnl
-                    # Also patch the reference in layerwise module
-                    _lw.get_numel_loaded = _logged_gnl
-                    _meta._tq_patched = True
+                for pname, param in layer.named_parameters(recurse=False):
+                    if pname in orig_loaders:
+                        param.weight_loader = _make_buffering_loader(
+                            pname, orig_loaders[pname],
+                        )
 
-            def process_weights_after_loading(self, layer: nn.Module) -> None:
-                if hasattr(layer, "_tq_w13_weight"):
-                    return  # guard: called twice (online + global sweep)
-
-                import sys
-                print(
-                    f"[TQ-DEBUG] MoE process_weights: {layer.__class__.__name__} "
-                    f"w13={getattr(layer, 'w13_weight', None) is not None} "
-                    f"w13_device={getattr(layer.w13_weight, 'device', '?') if hasattr(layer, 'w13_weight') else '?'} "
-                    f"GPU={torch.cuda.memory_allocated()/1e9:.1f}GB",
-                    file=sys.stderr, flush=True,
-                )
-
+            def _do_compress(self, layer: nn.Module) -> None:
+                """Kernel setup + TQ3 compression. Called after materialization."""
                 nonlocal _shared_moe_scratch_pool
 
                 from turboquant_vllm.moe_quant import TurboQuantFusedMoEScratchPool
@@ -421,6 +445,15 @@ def register():
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+            def process_weights_after_loading(self, layer: nn.Module) -> None:
+                # Compression handled by _materialize_and_process (triggered
+                # by buffering loader). This guard handles the global sweep.
+                if not hasattr(layer, "_tq_w13_weight"):
+                    # Not yet compressed — run compression now (fallback
+                    # for modules where buffering didn't trigger)
+                    if hasattr(layer, "w13_weight") and layer.w13_weight.numel() > 0:
+                        self._do_compress(layer)
 
             def get_fused_moe_quant_config(self, layer: nn.Module):
                 return self._unquant.get_fused_moe_quant_config(layer)
