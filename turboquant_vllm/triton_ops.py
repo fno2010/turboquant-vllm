@@ -149,7 +149,9 @@ if HAS_TRITON:
             w_deq = w_deq * norms[:, None]
 
             # Accumulate GEMM: (BLOCK_M, GROUP_SIZE) @ (GROUP_SIZE, BLOCK_N)
-            acc += tl.dot(a_tile, tl.trans(w_deq))
+            # Cast to output dtype for tensor core GEMM (bf16/fp16 ~2x faster)
+            out_dt = c_ptr.type.element_ty
+            acc += tl.dot(a_tile.to(out_dt), tl.trans(w_deq).to(out_dt))
 
         # Bias
         if bias_ptr:
@@ -226,6 +228,8 @@ def tq_fused_gemm(
 
     M, K = x.shape
     N = norms.shape[0]
+    if M == 0:
+        return torch.empty((*orig_shape[:-1], N), dtype=x.dtype, device=x.device)
     n_groups = norms.shape[1]  # use norms shape as authority (may differ from K // group_size due to padding)
 
     if K % group_size != 0 or K // group_size != n_groups:
@@ -240,7 +244,9 @@ def tq_fused_gemm(
     # Tile sizes limited by shared memory: rotation matrix (GROUP_SIZE^2 * 4 bytes)
     # plus tile data must fit in ~164 KB (A100). For group_size=128: rotation = 64 KB,
     # leaving ~100 KB for tiles → BLOCK_M, BLOCK_N ≤ 32.
-    max_block = 32 if group_size >= 128 else 64
+    # Rotation matrix uses GROUP_SIZE^2 * 4 bytes of shared memory;
+    # cap block sizes to stay within hardware limits (~100 KB on Ada).
+    max_block = 16 if group_size >= 128 else 32
     BLOCK_M = min(max_block, triton.next_power_of_2(M))
     BLOCK_N = min(max_block, triton.next_power_of_2(N))
 
@@ -515,7 +521,8 @@ if HAS_TRITON:
             values = values * norms[:, None]
 
             # Dot product: (BLOCK_M, BLOCK_N) += (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N)
-            acc += tl.dot(x_tile, tl.trans(values))
+            out_dt = out_ptr.type.element_ty
+            acc += tl.dot(x_tile.to(out_dt), tl.trans(values).to(out_dt))
 
         # Bias
         if bias_ptr:
@@ -567,6 +574,8 @@ def tq_fwht_input_gemm(
 
     M, K = x.shape
     N = norms.shape[0]
+    if M == 0:
+        return torch.empty((*orig_shape[:-1], N), dtype=x.dtype, device=x.device)
     n_groups = norms.shape[1]
 
     padded_K = n_groups * group_size
