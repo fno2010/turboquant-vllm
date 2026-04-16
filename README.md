@@ -1,14 +1,17 @@
 # turboquant-vllm
 
-TurboQuant+ compression for vLLM. What this package ships today:
+Model compression for vLLM. What this package ships today:
 
-- **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in 9 seconds, zero calibration. Faster than uncompressed serving. **Unique to this plugin.**
+- **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in seconds, zero calibration. Algorithm is the scalar case of HIGGS; see "How it works" below.
 - **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada) and large-model deployments (GLM-5.1 754B on 2×H200). MoE expert regrouping handled automatically.
+- **MLX port for Apple Silicon** (`turboquant_vllm.mlx_ops`) — 49× faster than the PyTorch CPU fallback on M4 Pro, enabling local dev-loop iteration on Mac without paid GPUs.
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
 
 > **KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is now upstream in vLLM via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** by @vibhavagarwal5 (merged 2026-04-15). Use `--kv-cache-dtype turboquant_3bit_nc` (or `k8v4`, `4bit_nc`, `k3v4_nc`) on stock vLLM with no plugin required. This package's role going forward is weight quantization + MLA KV compression + the supporting tooling, not the standard KV-cache path.
+
+> **Weight compression is also going upstream**: [vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970) adds the Linear-only weight-compression path as `--quantization turboquant` (scalar HIGGS). Opened 2026-04-16, awaiting maintainer triage. Once merged, upstream vLLM will have the weight path; MoE compression stays here until the follow-up upstream PR lands.
 
 ## Quick start
 
@@ -105,7 +108,9 @@ pip install turboquant-plus-vllm@git+https://github.com/varjoranta/turboquant-vl
 
 ## How it works
 
-Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). After a random rotation, vector coordinates become easier to quantize. Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. No calibration data needed.
+The weight-compression algorithm is the scalar case of **HIGGS** (Malinovskii, Panferov, Ilin, Guo, Richtárik, Alistarh — *Pushing the Limits of LLM Quantization via the Linearity Theorem*, [NAACL 2025](https://aclanthology.org/2025.naacl-long.543/), preprint [arXiv:2411.17525](https://arxiv.org/abs/2411.17525)): Random Hadamard Transform + MSE-optimal Lloyd-Max grid + per-group normalization. No calibration data. A reference implementation also exists in HuggingFace transformers as `HiggsConfig`.
+
+The project was originally based on [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026), which is a more general online **vector** quantizer targeted at KV cache and ANN vector search — not weight compression. Engineering simplifications during development (scalar over vector, WHT over general random rotations, Lloyd-Max over learned grids) converged the weight path onto HIGGS. The `turboquant` naming is kept for API and package compatibility; the actual TurboQuant application is the KV-cache path in [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479). Thanks to @dalistarh for the attribution catch.
 
 Extended by [turboquant_plus](https://github.com/TheTom/turboquant_plus) for KV cache:
 
@@ -251,7 +256,7 @@ ENV TQ_WEIGHT_BITS=3
 TQ_WEIGHT_BITS=3 vllm serve google/gemma-4-26B-A4B-it
 ```
 
-Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. Weight compression inspired by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
+The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2025) — see "How it works" above for the full attribution. Weight compression was seeded by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
 ### Results
 
@@ -304,7 +309,7 @@ Until a faster compressed-GEMM kernel lands, TQ3 is a **memory win, not a speed 
 
 **MoE weight quantization under vLLM 0.19 — full CUDA graph capture.** `FusedMoE` expert weights are compressed via a `FusedMoEMethodBase` subclass installed through `FusedMoE._replace_quant_method` ([varjoranta/turboquant-vllm#14](https://github.com/varjoranta/turboquant-vllm/issues/14)). `apply()` decompresses both `w13` / `w2` per layer per forward into a shared scratch pool and delegates to the base unquantized method. All CUDA dequant kernels launch on PyTorch's current stream via `c10::cuda::getCurrentCUDAStream`, so piecewise CUDA graph capture works correctly. Validated on Qwen3-30B-A3B (48 layers, 128 experts): coherent output, 123 tok/s at c=1 on A100 80GB — matching the BF16 baseline. No `--enforce-eager` required.
 
-3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
+3-bit sub-byte packing: 8 indices per 3 bytes. Per-group shape-gain decomposition (Gray 1984): stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit. (The "shape-gain" name is the classical VQ term — `vector = gain · unit_direction`; confirmed by @dalistarh as the established attribution.)
 
 ### Perplexity (WikiText-2, Gemma 4 26B-A4B-it, H100 80GB)
 
@@ -378,6 +383,33 @@ This is the same pattern vLLM uses for online FP8 quantization. No `TQ_WEIGHT_BI
 - **V100 16GB**: model loads (12 GB) but not enough room for KV cache. Minimum practical is 24 GB.
 - **TQ2 (2-bit)** destroys quality. 4 centroids too few for MLP weight distributions.
 - **Native TQ3 inference speed** is slower than runtime compression due to per-forward-pass decompression overhead.
+
+## Mac dev loop (MLX)
+
+Apple Silicon port of the dequant pipeline. Lets you iterate on TQ3 quality locally without paid GPU time — compress a checkpoint, load, generate, measure.
+
+Per-layer benchmark on M4 Pro 48GB against a real Linear from the Qwen3-Coder-30B-A3B TQ3 checkpoint (4096×2048 q_proj):
+
+| Path | ms/call | Speedup vs CPU |
+|---|---|---|
+| PyTorch CPU fallback | 44.32 | 1.0x (baseline) |
+| MLX native | 1.81 | 24.5x |
+| MLX + `mx.compile` fusion | 1.59 | 27.8x |
+| MLX + FWHT-on-input | 0.94 | 47.0x |
+| **MLX + FWHT-on-input + compile** | **0.90** | **49.2x** |
+
+The FWHT-on-input trick exploits the WHT's self-inverse property — apply forward WHT to the input once per group instead of inverse WHT to every weight row. The same optimization our CUDA path uses, ported to MLX with `mx.hadamard_transform`. Validated to rtol=5e-3 against the dense dequant + matmul reference.
+
+```python
+from turboquant_vllm.mlx_ops import (
+    PolarQuantStateMLX,
+    fwht_on_input_matmul_mlx,
+    unpack_indices_3bit_mlx,
+)
+from turboquant_vllm.mlx_model import TurboQuantMLXLinear
+```
+
+The MLX path is **opt-in** — nothing in the CUDA/Triton/CPU paths imports it, so Linux/vLLM users are unaffected. See `scripts/bench_mlx_vs_cpu.py` for the full benchmark. Full integration with `mlx-lm` (model loader + `mlx_lm.server`) is still pending.
 
 ## Expert pruning (REAP)
 
@@ -514,11 +546,15 @@ Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blo
 
 ## Related projects
 
-- **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. This project is published as [`turboquant-plus-vllm`](https://pypi.org/project/turboquant-plus-vllm/).
+- **[vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970)** — Our upstream vLLM PR adding weight compression as `--quantization turboquant` (Linear-only, MoE deferred). Mirrors what this plugin does, landed into vLLM's `OnlineQuantScheme` framework. Awaiting maintainer review.
+- **[vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** — @vibhavagarwal5's upstream TurboQuant KV-cache PR (merged 2026-04-15). The actual TurboQuant algorithm for KV + ANN.
+- **[HIGGS paper](https://aclanthology.org/2025.naacl-long.543/)** — Malinovskii, Panferov, Ilin, Guo, Richtárik, Alistarh; NAACL 2025. Primary algorithm citation for this plugin's weight path (preprint [arXiv:2411.17525](https://arxiv.org/abs/2411.17525)). Reference implementation also in HuggingFace transformers as `HiggsConfig`.
+- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026. Online vector quantizer for KV cache / ANN — the framework this project started from, and the algorithm behind #38479's KV path.
+- **[Vector Quantization (Gray 1984)](https://www.csd.uoc.gr/~hy474/bibliography/VectorQuantizationGray.pdf)** — classical reference for shape-gain decomposition, the per-group norm refinement we use.
+- **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent TurboQuant-for-vLLM implementation by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths, and vLLM paged cache integration. Published as [`turboquant-plus-vllm`](https://pypi.org/project/turboquant-plus-vllm/).
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
 - **TQ3_1S for llama.cpp** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit. Inspired the weight quantization feature in this package.
-- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026. The underlying algorithm.
 - **[REAP](https://arxiv.org/abs/2510.13999)** — Cerebras, ICLR 2026. Router-weighted expert pruning for MoE compression.
 - **[SpinQuant](https://arxiv.org/abs/2405.16406)** — Facebook Research, ICLR 2025. Learned rotation optimization (up to 45% improvement over fixed Hadamard). Our `learned_rotation.py` implements a simplified version.
 - **[SqueezeLLM](https://arxiv.org/abs/2306.07629)** — ICML 2024. Sensitivity-weighted codebooks and sparse outlier extraction. Influenced our research direction.
