@@ -99,8 +99,6 @@ def _fast_wht_batch(x: torch.Tensor) -> torch.Tensor:
     return x / math.sqrt(n)
 
 
-
-
 # ---------------------------------------------------------------------------
 # PolarQuant quantizer
 # ---------------------------------------------------------------------------
@@ -282,7 +280,9 @@ _rotation_matrix_cache: dict[tuple, torch.Tensor] = {}
 
 
 def _build_rotation_matrix(
-    signs1: torch.Tensor, signs2: torch.Tensor, group_size: int,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    group_size: int,
 ) -> torch.Tensor:
     """Pre-compute inverse rotation matrix W_rot = H @ D2 @ D1 / sqrt(n)."""
     n = group_size
@@ -294,13 +294,17 @@ def _build_rotation_matrix(
 
 
 def _get_cached_rotation_matrix(
-    signs1: torch.Tensor, signs2: torch.Tensor, group_size: int,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    group_size: int,
 ) -> torch.Tensor:
     """Get or build cached rotation matrix."""
     key = (id(signs1), id(signs2), group_size)
     if key not in _rotation_matrix_cache:
         _rotation_matrix_cache[key] = _build_rotation_matrix(
-            signs1, signs2, group_size,
+            signs1,
+            signs2,
+            group_size,
         ).contiguous()
     return _rotation_matrix_cache[key]
 
@@ -327,15 +331,29 @@ if _HAS_TRITON:
 
     @triton.jit
     def _tq_fused_gemm_kernel(
-        a_ptr, stride_am, stride_ak,
-        packed_ptr, norms_ptr,
-        stride_packed_n, stride_packed_k, stride_norms_n, stride_norms_g,
-        w_rot_ptr, centroids_ptr,
-        c_ptr, stride_cm, stride_cn,
+        a_ptr,
+        stride_am,
+        stride_ak,
+        packed_ptr,
+        norms_ptr,
+        stride_packed_n,
+        stride_packed_k,
+        stride_norms_n,
+        stride_norms_g,
+        w_rot_ptr,
+        centroids_ptr,
+        c_ptr,
+        stride_cm,
+        stride_cn,
         bias_ptr,
-        M, N, K, n_groups,
-        GROUP_SIZE: tl.constexpr, BITS: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        M,
+        N,
+        K,
+        n_groups,
+        GROUP_SIZE: tl.constexpr,
+        BITS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
     ):
         """Fused TQ dequant-GEMM: unpack + codebook + rotate + scale + accumulate.
 
@@ -419,15 +437,28 @@ if _HAS_TRITON:
     )
     @triton.jit
     def _polar_fused_gemm_kernel(
-        x_rot_ptr, stride_xm, stride_xk,
-        codes_ptr, stride_cn, stride_ck,
-        norms_ptr, stride_nn, stride_ng,
+        x_rot_ptr,
+        stride_xm,
+        stride_xk,
+        codes_ptr,
+        stride_cn,
+        stride_ck,
+        norms_ptr,
+        stride_nn,
+        stride_ng,
         ct_ptr,
-        out_ptr, stride_om, stride_on,
+        out_ptr,
+        stride_om,
+        stride_on,
         bias_ptr,
-        batch_size, out_f, in_f_padded, n_groups,
-        BLOCK_K: tl.constexpr, BITS: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        batch_size,
+        out_f,
+        in_f_padded,
+        n_groups,
+        BLOCK_K: tl.constexpr,
+        BITS: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
     ):
         """FWHT-on-input: codebook dot product with pre-rotated input.
 
@@ -525,15 +556,29 @@ def _tq_fused_gemm_launcher(
         norms = norms.contiguous()
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _tq_fused_gemm_kernel[grid](
-        x, x.stride(0), x.stride(1),
-        packed_weight, norms,
-        packed_weight.stride(0), packed_weight.stride(1),
-        norms.stride(0), norms.stride(1),
-        w_rot, centroids,
-        output, output.stride(0), output.stride(1),
-        bias, M, N, K, n_groups,
-        GROUP_SIZE=group_size, BITS=bits,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        x,
+        x.stride(0),
+        x.stride(1),
+        packed_weight,
+        norms,
+        packed_weight.stride(0),
+        packed_weight.stride(1),
+        norms.stride(0),
+        norms.stride(1),
+        w_rot,
+        centroids,
+        output,
+        output.stride(0),
+        output.stride(1),
+        bias,
+        M,
+        N,
+        K,
+        n_groups,
+        GROUP_SIZE=group_size,
+        BITS=bits,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
     )
     if len(orig_shape) > 2:
         output = output.reshape(*orig_shape[:-1], N)
@@ -570,13 +615,26 @@ def _tq_fwht_input_gemm_launcher(
         triton.cdiv(N, META["BLOCK_N"]),
     )
     _polar_fused_gemm_kernel[grid](
-        x_rot, x_rot.stride(0), x_rot.stride(1),
-        packed_weight, packed_weight.stride(0), packed_weight.stride(1),
-        norms, norms.stride(0), norms.stride(1),
+        x_rot,
+        x_rot.stride(0),
+        x_rot.stride(1),
+        packed_weight,
+        packed_weight.stride(0),
+        packed_weight.stride(1),
+        norms,
+        norms.stride(0),
+        norms.stride(1),
         centroids,
-        output, output.stride(0), output.stride(1),
-        bias, M, N, padded_K, n_groups,
-        BLOCK_K=BLOCK_K, BITS=bits,
+        output,
+        output.stride(0),
+        output.stride(1),
+        bias,
+        M,
+        N,
+        padded_K,
+        n_groups,
+        BLOCK_K=BLOCK_K,
+        BITS=bits,
     )
     if len(orig_shape) > 2:
         output = output.reshape(*orig_shape[:-1], N)
@@ -588,16 +646,31 @@ def _tq_fwht_input_gemm_launcher(
 try:
 
     @torch.library.custom_op(
-        "turboquant::tq_fused_gemm", mutates_args=(), device_types=("cuda",),
+        "turboquant::tq_fused_gemm",
+        mutates_args=(),
+        device_types=("cuda",),
     )
     def _tq_fused_gemm_op(
-        x: torch.Tensor, packed_weight: torch.Tensor, norms: torch.Tensor,
-        signs1: torch.Tensor, signs2: torch.Tensor, centroids: torch.Tensor,
-        group_size: int, bits: int, bias: torch.Tensor | None,
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        group_size: int,
+        bits: int,
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
         return _tq_fused_gemm_launcher(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size=group_size, bits=bits, bias=bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size=group_size,
+            bits=bits,
+            bias=bias,
         )
 
     @_tq_fused_gemm_op.register_fake
@@ -606,16 +679,31 @@ try:
         return x.new_empty((*x.shape[:-1], N))
 
     @torch.library.custom_op(
-        "turboquant::tq_fwht_input_gemm", mutates_args=(), device_types=("cuda",),
+        "turboquant::tq_fwht_input_gemm",
+        mutates_args=(),
+        device_types=("cuda",),
     )
     def _tq_fwht_input_gemm_op(
-        x: torch.Tensor, packed_weight: torch.Tensor, norms: torch.Tensor,
-        signs1: torch.Tensor, signs2: torch.Tensor, centroids: torch.Tensor,
-        group_size: int, bits: int, bias: torch.Tensor | None,
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        group_size: int,
+        bits: int,
+        bias: torch.Tensor | None,
     ) -> torch.Tensor:
         return _tq_fwht_input_gemm_launcher(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size=group_size, bits=bits, bias=bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size=group_size,
+            bits=bits,
+            bias=bias,
         )
 
     @_tq_fwht_input_gemm_op.register_fake
@@ -623,18 +711,30 @@ try:
         N = norms.shape[0]
         return x.new_empty((*x.shape[:-1], N))
 
-    def tq_fused_gemm(x, packed_weight, norms, signs1, signs2, centroids,
-                      group_size=128, bits=4, bias=None):
+    def tq_fused_gemm(x, packed_weight, norms, signs1, signs2, centroids, group_size=128, bits=4, bias=None):
         return torch.ops.turboquant.tq_fused_gemm(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size, bits, bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size,
+            bits,
+            bias,
         )
 
-    def tq_fwht_input_gemm(x, packed_weight, norms, signs1, signs2, centroids,
-                           group_size=128, bits=4, bias=None):
+    def tq_fwht_input_gemm(x, packed_weight, norms, signs1, signs2, centroids, group_size=128, bits=4, bias=None):
         return torch.ops.turboquant.tq_fwht_input_gemm(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size, bits, bias,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size,
+            bits,
+            bias,
         )
 except (AttributeError, RuntimeError, NameError):
     # Triton not available — tq_fused_gemm / tq_fwht_input_gemm undefined
