@@ -21,13 +21,12 @@ import torch
 import torch.nn as nn
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizeMethodBase,
-)
+from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
 from vllm.model_executor.parameter import ModelWeightParameter
+from vllm.utils.math_utils import next_power_of_2, round_up
 
 logger = init_logger(__name__)
 
@@ -100,11 +99,6 @@ def _fast_wht_batch(x: torch.Tensor) -> torch.Tensor:
     return x / math.sqrt(n)
 
 
-def _next_pow2(n: int) -> int:
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +131,7 @@ class _PolarQuant:
         self.device = dev
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        self.padded_dim = _next_pow2(dim)
+        self.padded_dim = next_power_of_2(dim)
         self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(dev)
         self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(dev)
 
@@ -201,7 +195,7 @@ class _PolarQuant:
 
 def _padded_size(dim: int, group_size: int) -> tuple[int, int]:
     """Return (padded_dim, n_groups) for group quantization."""
-    padded = ((dim + group_size - 1) // group_size) * group_size
+    padded = round_up(dim, group_size)
     return padded, padded // group_size
 
 
@@ -275,28 +269,377 @@ def _unpack_indices(packed: torch.Tensor, bits: int, dim: int) -> torch.Tensor:
 # Triton kernels (FWHT-on-input GEMM + fused dequant-GEMM)
 # ---------------------------------------------------------------------------
 
-# Lazy-loaded to avoid import errors when Triton isn't available
-_triton_available: bool | None = None
-_tq_fwht_input_fn = None
-_tq_fused_gemm_fn = None
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+# Rotation matrix cache: (id(signs1), id(signs2), group_size) → tensor
+_rotation_matrix_cache: dict[tuple, torch.Tensor] = {}
 
 
-def _ensure_triton():
-    """Lazy-load Triton kernels. Must be called before forward, not inside."""
-    global _triton_available, _tq_fwht_input_fn, _tq_fused_gemm_fn
-    if _triton_available is not None:
-        return _triton_available
-    try:
-        # Import from the plugin's Triton ops if available,
-        # otherwise fall back to PyTorch dequant path
-        from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
+def _build_rotation_matrix(
+    signs1: torch.Tensor, signs2: torch.Tensor, group_size: int,
+) -> torch.Tensor:
+    """Pre-compute inverse rotation matrix W_rot = H @ D2 @ D1 / sqrt(n)."""
+    n = group_size
+    eye = torch.eye(n, device=signs1.device, dtype=torch.float32)
+    rotated = eye * signs2.unsqueeze(0)
+    rotated = _fast_wht_batch(rotated)
+    rotated = rotated * signs1.unsqueeze(0)
+    return rotated
 
-        _tq_fused_gemm_fn = tq_fused_gemm
-        _tq_fwht_input_fn = tq_fwht_input_gemm
-        _triton_available = True
-    except (ImportError, Exception):
-        _triton_available = False
-    return _triton_available
+
+def _get_cached_rotation_matrix(
+    signs1: torch.Tensor, signs2: torch.Tensor, group_size: int,
+) -> torch.Tensor:
+    """Get or build cached rotation matrix."""
+    key = (id(signs1), id(signs2), group_size)
+    if key not in _rotation_matrix_cache:
+        _rotation_matrix_cache[key] = _build_rotation_matrix(
+            signs1, signs2, group_size,
+        ).contiguous()
+    return _rotation_matrix_cache[key]
+
+
+def _rotate_input(
+    x: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Apply forward rotation to input, grouped by group_size."""
+    batch = x.shape[0]
+    K = x.shape[1]
+    padded_K = ((K + group_size - 1) // group_size) * group_size
+    if padded_K > K:
+        x = torch.nn.functional.pad(x, (0, padded_K - K))
+    w_rot = _get_cached_rotation_matrix(signs1, signs2, group_size)
+    x_grouped = x.reshape(-1, group_size)
+    x_grouped = torch.matmul(x_grouped, w_rot.T)
+    return x_grouped.reshape(batch, padded_K)
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _tq_fused_gemm_kernel(
+        a_ptr, stride_am, stride_ak,
+        packed_ptr, norms_ptr,
+        stride_packed_n, stride_packed_k, stride_norms_n, stride_norms_g,
+        w_rot_ptr, centroids_ptr,
+        c_ptr, stride_cm, stride_cn,
+        bias_ptr,
+        M, N, K, n_groups,
+        GROUP_SIZE: tl.constexpr, BITS: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """Fused TQ dequant-GEMM: unpack + codebook + rotate + scale + accumulate.
+
+        Note: 3-bit unpacking logic is duplicated in _polar_fused_gemm_kernel
+        (Triton JIT kernels cannot share helper functions).
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, GROUP_SIZE)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        rot_offs = offs_k[:, None] * GROUP_SIZE + offs_k[None, :]
+        w_rot = tl.load(w_rot_ptr + rot_offs)
+        for g in range(n_groups):
+            k_start = g * GROUP_SIZE
+            a_offs = offs_m[:, None] * stride_am + (k_start + offs_k[None, :]) * stride_ak
+            a_mask = (offs_m[:, None] < M) & ((k_start + offs_k[None, :]) < K)
+            a_tile = tl.load(a_ptr + a_offs, mask=a_mask, other=0.0).to(tl.float32)
+            packed_row = offs_n * n_groups + g
+            if BITS == 4:
+                byte_idx = offs_k // 2
+                is_hi = (offs_k % 2).to(tl.int32)
+                pe = packed_row[:, None] * stride_packed_n + byte_idx[None, :] * stride_packed_k
+                pb = tl.load(packed_ptr + pe, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                indices = tl.where(is_hi[None, :] > 0, (pb >> 4) & 0xF, pb & 0xF)
+            elif BITS == 3:
+                g8 = offs_k // 8
+                p8 = offs_k % 8
+                bo = p8 * 3
+                fb = bo // 8
+                bib = (bo % 8).to(tl.int32)
+                crosses = bib > 5
+                bi0 = g8 * 3 + fb
+                bi1 = bi0 + 1
+                p0 = packed_row[:, None] * stride_packed_n + bi0[None, :] * stride_packed_k
+                b0 = tl.load(packed_ptr + p0, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                p1 = packed_row[:, None] * stride_packed_n + bi1[None, :] * stride_packed_k
+                b1 = tl.load(packed_ptr + p1, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                single = (b0 >> bib[None, :]) & 0x7
+                cross = ((b0 >> bib[None, :]) | (b1 << (8 - bib[None, :]))) & 0x7
+                indices = tl.where(crosses[None, :], cross, single)
+            elif BITS == 2:
+                byte_idx = offs_k // 4
+                shift = (offs_k % 4).to(tl.int32) * 2
+                pe = packed_row[:, None] * stride_packed_n + byte_idx[None, :] * stride_packed_k
+                pb = tl.load(packed_ptr + pe, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                indices = (pb >> shift[None, :]) & 0x3
+            else:
+                pe = packed_row[:, None] * stride_packed_n + offs_k[None, :] * stride_packed_k
+                indices = tl.load(packed_ptr + pe, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+            centroid_vec = tl.load(centroids_ptr + indices)
+            w_deq = tl.dot(centroid_vec, w_rot)
+            norm_offs = offs_n * stride_norms_n + g * stride_norms_g
+            norms = tl.load(norms_ptr + norm_offs, mask=offs_n < N, other=0.0)
+            w_deq = w_deq * norms[:, None]
+            # Cast to output dtype for tensor core GEMM (bf16/fp16 ~2x faster)
+            out_dt = c_ptr.type.element_ty
+            acc += tl.dot(a_tile.to(out_dt), tl.trans(w_deq).to(out_dt))
+        if bias_ptr:
+            bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+            acc += bias[None, :]
+        c_offs = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptr + c_offs, acc.to(c_ptr.type.element_ty), mask=c_mask)
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_M": 1, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 1, "BLOCK_N": 256}, num_warps=8, num_stages=2),
+            triton.Config({"BLOCK_M": 4, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 8, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 8, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        ],
+        key=["out_f", "in_f_padded"],
+    )
+    @triton.jit
+    def _polar_fused_gemm_kernel(
+        x_rot_ptr, stride_xm, stride_xk,
+        codes_ptr, stride_cn, stride_ck,
+        norms_ptr, stride_nn, stride_ng,
+        ct_ptr,
+        out_ptr, stride_om, stride_on,
+        bias_ptr,
+        batch_size, out_f, in_f_padded, n_groups,
+        BLOCK_K: tl.constexpr, BITS: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """FWHT-on-input: codebook dot product with pre-rotated input.
+
+        Note: 3-bit unpacking logic is duplicated in _tq_fused_gemm_kernel
+        (Triton JIT kernels cannot share helper functions).
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_m = offs_m < batch_size
+        mask_n = offs_n < out_f
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for g in range(n_groups):
+            offs_k = tl.arange(0, BLOCK_K)
+            x_ptrs = offs_m[:, None] * stride_xm + (g * BLOCK_K + offs_k)[None, :] * stride_xk
+            x_tile = tl.load(x_rot_ptr + x_ptrs, mask=mask_m[:, None], other=0.0)
+            packed_row = offs_n * n_groups + g
+            if BITS == 4:
+                bi = offs_k // 2
+                ih = offs_k % 2
+                cp = packed_row[:, None] * stride_cn + bi[None, :] * stride_ck
+                pk = tl.load(codes_ptr + cp, mask=mask_n[:, None], other=0).to(tl.int32)
+                codes = tl.where(ih[None, :] > 0, (pk >> 4) & 0xF, pk & 0xF)
+            elif BITS == 3:
+                g8 = offs_k // 8
+                p8 = offs_k % 8
+                bo = p8 * 3
+                fb = bo // 8
+                bib = (bo % 8).to(tl.int32)
+                crosses = bib > 5
+                bi0 = g8 * 3 + fb
+                bi1 = bi0 + 1
+                p0 = packed_row[:, None] * stride_cn + bi0[None, :] * stride_ck
+                b0 = tl.load(codes_ptr + p0, mask=mask_n[:, None], other=0).to(tl.int32)
+                p1 = packed_row[:, None] * stride_cn + bi1[None, :] * stride_ck
+                b1 = tl.load(codes_ptr + p1, mask=mask_n[:, None], other=0).to(tl.int32)
+                single = (b0 >> bib[None, :]) & 0x7
+                cross = ((b0 >> bib[None, :]) | (b1 << (8 - bib[None, :]))) & 0x7
+                codes = tl.where(crosses[None, :], cross, single)
+            elif BITS == 2:
+                bi = offs_k // 4
+                sh = (offs_k % 4).to(tl.int32) * 2
+                cp = packed_row[:, None] * stride_cn + bi[None, :] * stride_ck
+                pk = tl.load(codes_ptr + cp, mask=mask_n[:, None], other=0).to(tl.int32)
+                codes = (pk >> sh[None, :]) & 0x3
+            else:
+                cp = packed_row[:, None] * stride_cn + offs_k[None, :] * stride_ck
+                codes = tl.load(codes_ptr + cp, mask=mask_n[:, None], other=0).to(tl.int32)
+            values = tl.load(ct_ptr + codes)
+            norm_ptrs = offs_n * stride_nn + g * stride_ng
+            norms = tl.load(norms_ptr + norm_ptrs, mask=mask_n, other=0.0)
+            values = values * norms[:, None]
+            out_dt = out_ptr.type.element_ty
+            acc += tl.dot(x_tile.to(out_dt), tl.trans(values).to(out_dt))
+        if bias_ptr:
+            bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0)
+            acc += bias[None, :]
+        out_ptrs = offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+        out_mask = mask_m[:, None] & mask_n[None, :]
+        tl.store(out_ptr + out_ptrs, acc.to(out_ptr.type.element_ty), mask=out_mask)
+
+
+def _tq_fused_gemm_launcher(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    norms: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    centroids: torch.Tensor,
+    group_size: int = 128,
+    bits: int = 4,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fused TQ dequant + GEMM launcher."""
+    orig_shape = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    M, K = x.shape
+    N = norms.shape[0]
+    if M == 0:
+        return torch.empty((*orig_shape[:-1], N), dtype=x.dtype, device=x.device)
+    n_groups = norms.shape[1]
+    if K % group_size != 0 or K // group_size != n_groups:
+        raise ValueError(f"K={K} not aligned with group_size={group_size}")
+    w_rot = _get_cached_rotation_matrix(signs1, signs2, group_size)
+    output = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    # Rotation matrix uses GROUP_SIZE^2 * 4 bytes of shared memory;
+    # cap block sizes to stay within hardware limits (~100 KB on Ada).
+    max_block = 16 if group_size >= 128 else 32
+    BLOCK_M = min(max_block, triton.next_power_of_2(M))
+    BLOCK_N = min(max_block, triton.next_power_of_2(N))
+    if not packed_weight.is_contiguous():
+        packed_weight = packed_weight.contiguous()
+    if not norms.is_contiguous():
+        norms = norms.contiguous()
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    _tq_fused_gemm_kernel[grid](
+        x, x.stride(0), x.stride(1),
+        packed_weight, norms,
+        packed_weight.stride(0), packed_weight.stride(1),
+        norms.stride(0), norms.stride(1),
+        w_rot, centroids,
+        output, output.stride(0), output.stride(1),
+        bias, M, N, K, n_groups,
+        GROUP_SIZE=group_size, BITS=bits,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+    )
+    if len(orig_shape) > 2:
+        output = output.reshape(*orig_shape[:-1], N)
+    return output
+
+
+def _tq_fwht_input_gemm_launcher(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    norms: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    centroids: torch.Tensor,
+    group_size: int = 128,
+    bits: int = 4,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FWHT-on-input GEMM launcher. Rotates input once, then codebook dot."""
+    orig_shape = x.shape
+    x = x.reshape(-1, x.shape[-1])
+    M, K = x.shape
+    N = norms.shape[0]
+    if M == 0:
+        return torch.empty((*orig_shape[:-1], N), dtype=x.dtype, device=x.device)
+    n_groups = norms.shape[1]
+    padded_K = n_groups * group_size
+    if K != padded_K:
+        raise ValueError(f"K={K} != padded_K={padded_K}")
+    x_rot = _rotate_input(x.float(), signs1, signs2, group_size)
+    output = torch.empty(M, N, dtype=x.dtype, device=x.device)
+    BLOCK_K = group_size
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]),
+        triton.cdiv(N, META["BLOCK_N"]),
+    )
+    _polar_fused_gemm_kernel[grid](
+        x_rot, x_rot.stride(0), x_rot.stride(1),
+        packed_weight, packed_weight.stride(0), packed_weight.stride(1),
+        norms, norms.stride(0), norms.stride(1),
+        centroids,
+        output, output.stride(0), output.stride(1),
+        bias, M, N, padded_K, n_groups,
+        BLOCK_K=BLOCK_K, BITS=bits,
+    )
+    if len(orig_shape) > 2:
+        output = output.reshape(*orig_shape[:-1], N)
+    return output
+
+
+# Register as torch.library.custom_op for fullgraph compatibility.
+# Dynamo treats custom ops as opaque (no tracing into kernel body).
+try:
+
+    @torch.library.custom_op(
+        "turboquant::tq_fused_gemm", mutates_args=(), device_types=("cuda",),
+    )
+    def _tq_fused_gemm_op(
+        x: torch.Tensor, packed_weight: torch.Tensor, norms: torch.Tensor,
+        signs1: torch.Tensor, signs2: torch.Tensor, centroids: torch.Tensor,
+        group_size: int, bits: int, bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _tq_fused_gemm_launcher(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=bias,
+        )
+
+    @_tq_fused_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, group_size, bits, bias):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    @torch.library.custom_op(
+        "turboquant::tq_fwht_input_gemm", mutates_args=(), device_types=("cuda",),
+    )
+    def _tq_fwht_input_gemm_op(
+        x: torch.Tensor, packed_weight: torch.Tensor, norms: torch.Tensor,
+        signs1: torch.Tensor, signs2: torch.Tensor, centroids: torch.Tensor,
+        group_size: int, bits: int, bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _tq_fwht_input_gemm_launcher(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=bias,
+        )
+
+    @_tq_fwht_input_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, group_size, bits, bias):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    def tq_fused_gemm(x, packed_weight, norms, signs1, signs2, centroids,
+                      group_size=128, bits=4, bias=None):
+        return torch.ops.turboquant.tq_fused_gemm(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size, bits, bias,
+        )
+
+    def tq_fwht_input_gemm(x, packed_weight, norms, signs1, signs2, centroids,
+                           group_size=128, bits=4, bias=None):
+        return torch.ops.turboquant.tq_fwht_input_gemm(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size, bits, bias,
+        )
+except (AttributeError, RuntimeError, NameError):
+    # Triton not available — tq_fused_gemm / tq_fwht_input_gemm undefined
+    tq_fused_gemm = None  # type: ignore[assignment]
+    tq_fwht_input_gemm = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +647,7 @@ def _ensure_triton():
 # ---------------------------------------------------------------------------
 
 
-class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
+class TurboQuantOnlineLinearMethod(LinearMethodBase):
     """Online TQ3/TQ4 weight compression for Linear layers.
 
     Allocates bf16 weight on meta device (zero GPU at init). After
@@ -346,8 +689,7 @@ class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
         initialize_online_processing(layer)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
-        # Guard: called twice (online processing + global sweep)
-        if not hasattr(layer, "weight") or layer.weight.numel() == 0:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
         weight = layer.weight.data
@@ -380,14 +722,13 @@ class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
         layer.tq_out_features = out_dim
         layer.tq_padded_in = padded_in
 
-        # Cache Triton dispatch (must run before CUDA graph capture)
-        _ensure_triton()
-        if _triton_available:
-            layer._tq_primary_fn = _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
-            layer._tq_fallback_fn = _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
+        if tq_fused_gemm is not None:
+            layer._tq_primary_fn = tq_fwht_input_gemm if out_dim >= 4096 else tq_fused_gemm
+            layer._tq_fallback_fn = tq_fused_gemm if out_dim >= 4096 else tq_fwht_input_gemm
         else:
             layer._tq_primary_fn = None
 
+        layer._already_called_process_weights_after_loading = True
         del weight, padded, grouped, indices, norms_raw
 
     def apply(
@@ -396,6 +737,10 @@ class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Pad input if in_dim was not a multiple of group_size
+        if x.shape[-1] != layer.tq_padded_in:
+            x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
+
         if layer._tq_primary_fn is not None:
             args = (
                 x,
@@ -407,7 +752,8 @@ class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
             )
             try:
                 return layer._tq_primary_fn(*args, group_size=self.group_size, bits=self.bits, bias=bias)
-            except (ValueError, RuntimeError):
+            except (ValueError, RuntimeError) as e:
+                logger.warning_once("TurboQuant primary kernel failed, using fallback: %s", e)
                 return layer._tq_fallback_fn(*args, group_size=self.group_size, bits=self.bits, bias=bias)
 
         # PyTorch fallback (no Triton)
@@ -415,7 +761,7 @@ class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
         norms_flat = layer.tq_norms.reshape(-1)
         quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
         w_groups = quantizer.dequantize(indices, norms_flat)
-        w_deq = w_groups.reshape(layer.tq_out_features, layer.tq_padded_in)[:, : layer.tq_in_features].to(x.dtype)
+        w_deq = w_groups.reshape(layer.tq_out_features, layer.tq_padded_in).to(x.dtype)
         output = torch.matmul(x, w_deq.t())
         if bias is not None:
             output = output + bias
