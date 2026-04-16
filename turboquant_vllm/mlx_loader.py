@@ -49,6 +49,34 @@ def _build_state(group_size: int, bits: int, seed: int) -> PolarQuantStateMLX:
     return PolarQuantStateMLX.from_torch_quantizer(pq)
 
 
+def _rewrite_legacy_rope_keys(config: dict[str, Any]) -> None:
+    """Translate the new consolidated ``rope_parameters`` dict back to the
+    legacy ``rope_theta``/``rope_scaling`` keys.
+
+    Transformers 4.52+ serialises RoPE settings as one ``rope_parameters``
+    object, but the mlx_lm model classes still read the legacy keys.
+    Without this, ``AutoConfig.save_pretrained(...)`` through
+    ``save_tq3_checkpoint`` produces configs mlx_lm can't load.
+
+    Also handles ``text_config.rope_parameters`` for nested configs
+    (Qwen3.5-MoE, Gemma 4, etc.).
+    """
+
+    def rewrite(d: dict) -> None:
+        rp = d.get("rope_parameters")
+        if not isinstance(rp, dict):
+            return
+        if "rope_theta" not in d and "rope_theta" in rp:
+            d["rope_theta"] = rp["rope_theta"]
+        if "rope_scaling" not in d and rp.get("rope_type") not in (None, "default"):
+            d["rope_scaling"] = rp
+
+    rewrite(config)
+    tc = config.get("text_config")
+    if isinstance(tc, dict):
+        rewrite(tc)
+
+
 def _set_by_path(root: nn.Module, dotted: str, new_module: nn.Module) -> None:
     """Navigate ``root.a.b.c`` (with numeric parts as list indices) and
     set the final attribute to ``new_module``."""
@@ -194,6 +222,7 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
     sensitive_bits = tq_config.get("sensitive_bits")
 
     config = load_config(model_path)
+    _rewrite_legacy_rope_keys(config)
     model_class, model_args_class = _get_classes(config=config)
     model_args = model_args_class.from_dict(config)
     model = model_class(model_args)
