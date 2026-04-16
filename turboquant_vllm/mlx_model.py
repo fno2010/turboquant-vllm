@@ -27,7 +27,7 @@ import mlx.nn as nn
 
 from turboquant_vllm.mlx_ops import (
     PolarQuantStateMLX,
-    polar_quant_dequantize_mlx,
+    fwht_on_input_matmul_mlx,
     unpack_indices_3bit_mlx,
 )
 from turboquant_vllm.weight_quant import padded_size
@@ -82,21 +82,23 @@ class TurboQuantMLXLinear(nn.Module):
         self._indices_grouped = unpack_indices_3bit_mlx(packed_weight, dim=self.padded_in).reshape(
             self.out_features * self.n_groups, self.group_size
         )
-        self._norms_flat = norms.reshape(self.out_features * self.n_groups)
 
     def __call__(self, x: mx.array) -> mx.array:
-        w_groups = polar_quant_dequantize_mlx(
-            indices=self._indices_grouped,
-            norms=self._norms_flat,
+        # fwht_on_input_matmul_mlx expects 2D (batch, in_features); flatten
+        # leading dims for 3D/4D token-streaming inputs and reshape on the
+        # way out.
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1]) if x.ndim > 2 else x
+
+        out_flat = fwht_on_input_matmul_mlx(
+            x=x_flat,
+            indices_grouped=self._indices_grouped,
+            norms=self.norms,
             state=self.quant_state,
+            bias=self.bias,
             output_dtype=x.dtype,
         )
-        w = w_groups.reshape(self.out_features, self.padded_in)
 
-        if self._pad_needed:
-            x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, self.padded_in - x.shape[-1])])
-
-        out = x @ w.T
-        if self.bias is not None:
-            out = out + self.bias.astype(out.dtype)
-        return out
+        if x.ndim > 2:
+            return out_flat.reshape(*orig_shape[:-1], self.out_features)
+        return out_flat
