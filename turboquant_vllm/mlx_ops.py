@@ -64,6 +64,29 @@ def fast_wht_batch_mlx(x: mx.array) -> mx.array:
     return mx.hadamard_transform(x)
 
 
+def rht_on_last_dim_mlx(
+    x: mx.array,
+    signs1: mx.array,
+    signs2: mx.array,
+    n_groups: int,
+    group_size: int,
+) -> mx.array:
+    """Apply the randomized Hadamard transform (D2 · WHT · D1) group-wise
+    over ``x``'s last dim.
+
+    Shared by the dense ``fwht_on_input_matmul_mlx`` and the SwitchLinear
+    MoE forward — both need to rotate activations into the same frame the
+    weight codebook was trained in before the matmul. Input's last dim
+    must already be ``n_groups * group_size`` (caller pads).
+    """
+    leading = x.shape[:-1]
+    x_g = x.reshape(*leading, n_groups, group_size)
+    x_g = x_g * signs1
+    x_g = mx.hadamard_transform(x_g)
+    x_g = x_g * signs2
+    return x_g
+
+
 def unpack_indices_3bit_mlx(packed: mx.array, dim: int) -> mx.array:
     """Unpack 3-bit indices from uint8 into int32.
 
@@ -116,7 +139,6 @@ def fwht_on_input_matmul_mlx(
     Best perf when wrapped in ``mx.compile`` (fuses the three sign/WHT
     multiplies into one compiled graph).
     """
-    batch = x.shape[0]
     group_size = state.dim
     out_features, n_groups = norms.shape
     padded_in = n_groups * group_size
@@ -124,10 +146,7 @@ def fwht_on_input_matmul_mlx(
     if x.shape[-1] != padded_in:
         x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, padded_in - x.shape[-1])])
 
-    x_g = x.reshape(batch, n_groups, group_size)
-    x_g = x_g * state.signs1[None, None, :]
-    x_g = mx.hadamard_transform(x_g)
-    x_g = x_g * state.signs2[None, None, :]
+    x_g = rht_on_last_dim_mlx(x, state.signs1, state.signs2, n_groups, group_size)
 
     # centroids are constructed as fp32 in from_torch_quantizer, so indexing
     # produces fp32 directly — no explicit cast needed.

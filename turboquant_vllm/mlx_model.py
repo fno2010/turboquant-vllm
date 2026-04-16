@@ -28,6 +28,7 @@ import mlx.nn as nn
 from turboquant_vllm.mlx_ops import (
     PolarQuantStateMLX,
     fwht_on_input_matmul_mlx,
+    rht_on_last_dim_mlx,
     unpack_indices_3bit_mlx,
 )
 from turboquant_vllm.weight_quant import padded_size
@@ -84,9 +85,6 @@ class TurboQuantMLXLinear(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        # fwht_on_input_matmul_mlx expects 2D (batch, in_features); flatten
-        # leading dims for 3D/4D token-streaming inputs and reshape on the
-        # way out.
         orig_shape = x.shape
         x_flat = x.reshape(-1, orig_shape[-1]) if x.ndim > 2 else x
 
@@ -166,24 +164,17 @@ class TurboQuantMLXSwitchLinear(nn.Module):
         indices: mx.array,
         sorted_indices: bool = False,
     ) -> mx.array:
-        # Pad input if the original in_features wasn't a multiple of group_size
         if self._pad_needed:
             x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, self.padded_in - self.in_features)])
 
-        # FWHT-on-input: apply the transform once per token, not per weight row
-        leading = x.shape[:-1]
-        x_groups = x.reshape(*leading, self.n_groups, self.group_size)
-        x_groups = x_groups * self.quant_state.signs1
-        x_groups = mx.hadamard_transform(x_groups)
-        x_groups = x_groups * self.quant_state.signs2
-        x_rot = x_groups.reshape(*leading, self.padded_in)
+        x_rot = rht_on_last_dim_mlx(
+            x, self.quant_state.signs1, self.quant_state.signs2, self.n_groups, self.group_size
+        ).reshape(*x.shape[:-1], self.padded_in)
 
-        # Dequantise all experts: codebook lookup + shape-gain scale
         w = self.quant_state.centroids[self._indices_grouped]
         w = w * self.norms[:, :, :, None]
         w = w.reshape(self.num_experts, self.out_features, self.padded_in).astype(x.dtype)
 
-        # Expert-routed matmul (same primitive SwitchLinear uses)
         out = mx.gather_mm(
             x_rot,
             w.swapaxes(-1, -2),
