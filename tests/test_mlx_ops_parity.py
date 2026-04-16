@@ -8,6 +8,7 @@ If this test passes, we know the MLX port of the dequant math is correct;
 the remaining work is wiring it into a model load path so ``mlx_lm.server``
 can serve TQ3 checkpoints.
 """
+
 from __future__ import annotations
 
 import sys

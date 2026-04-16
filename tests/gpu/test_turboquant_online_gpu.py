@@ -54,9 +54,7 @@ def test_triton_kernels() -> bool:
     # 4096 per process_weights_after_loading); exercise both.
     for out_dim, label in [(64, "small/fused"), (4096, "large/fwht")]:
         layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(
-            torch.randn(out_dim, 128, device="cuda", dtype=torch.bfloat16)
-        )
+        layer.weight = torch.nn.Parameter(torch.randn(out_dim, 128, device="cuda", dtype=torch.bfloat16))
         method.process_weights_after_loading(layer)
 
         # Reference: PyTorch-side unpack + dequantize + matmul
@@ -69,9 +67,7 @@ def test_triton_kernels() -> bool:
         ref = x @ w_deq.t()
         out = method.apply(layer, x, bias=None)
 
-        cos = torch.nn.functional.cosine_similarity(
-            ref.float(), out.float(), dim=1
-        )
+        cos = torch.nn.functional.cosine_similarity(ref.float(), out.float(), dim=1)
         min_cos = cos.min().item()
         status = "OK" if min_cos >= 0.90 else "FAIL"
         print(f"  {label}: cosine_sim={min_cos:.4f} {status}")

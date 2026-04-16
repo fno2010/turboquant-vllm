@@ -79,9 +79,9 @@ class TurboQuantMLXLinear(nn.Module):
         # and repeated unpacking on the hot path dominated early profiling.
         # Keep packed_weight too so introspection / reload paths can see it.
         self.packed_weight = packed_weight
-        self._indices_grouped = unpack_indices_3bit_mlx(
-            packed_weight, dim=self.padded_in
-        ).reshape(self.out_features * self.n_groups, self.group_size)
+        self._indices_grouped = unpack_indices_3bit_mlx(packed_weight, dim=self.padded_in).reshape(
+            self.out_features * self.n_groups, self.group_size
+        )
         self._norms_flat = norms.reshape(self.out_features * self.n_groups)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -94,9 +94,7 @@ class TurboQuantMLXLinear(nn.Module):
         w = w_groups.reshape(self.out_features, self.padded_in)
 
         if self._pad_needed:
-            x = mx.pad(
-                x, [(0, 0)] * (x.ndim - 1) + [(0, self.padded_in - x.shape[-1])]
-            )
+            x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, self.padded_in - x.shape[-1])])
 
         out = x @ w.T
         if self.bias is not None:

@@ -126,9 +126,9 @@ class TestTurboQuantMLXLinearParity(unittest.TestCase):
 
                 packed_mx = mx.array(comp["packed"].numpy())
                 norms_mx = mx.array(comp["norms"].numpy())
-                indices_grouped = unpack_indices_3bit_mlx(
-                    packed_mx, dim=comp["padded_in"]
-                ).reshape(out_features * comp["n_groups"], 128)
+                indices_grouped = unpack_indices_3bit_mlx(packed_mx, dim=comp["padded_in"]).reshape(
+                    out_features * comp["n_groups"], 128
+                )
 
                 torch.manual_seed(3)
                 x_pt = torch.randn(4, in_features, dtype=torch.float32)
@@ -139,9 +139,7 @@ class TestTurboQuantMLXLinearParity(unittest.TestCase):
 
                 indices = unpack_indices(comp["packed"], 3, 128)
                 w_groups = pq.dequantize(indices, comp["norms"].reshape(-1))
-                w_deq = w_groups.reshape(out_features, comp["padded_in"])[
-                    :, :in_features
-                ]
+                w_deq = w_groups.reshape(out_features, comp["padded_in"])[:, :in_features]
                 ref = (x_pt @ w_deq.t()).numpy()
 
                 out_mx = fwht_on_input_matmul_mlx(

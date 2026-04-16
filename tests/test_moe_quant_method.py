@@ -173,8 +173,7 @@ class TestCompressed3DDecompressInto(unittest.TestCase):
         self.assertEqual(out.dtype, ref.dtype)
         self.assertTrue(
             torch.allclose(out, ref),
-            f"decompress_into diverged from decompress: max abs diff = "
-            f"{(out - ref).abs().max().item():.6g}",
+            f"decompress_into diverged from decompress: max abs diff = {(out - ref).abs().max().item():.6g}",
         )
 
     def test_into_rejects_wrong_shape(self):
@@ -225,9 +224,7 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
                 expert.installed_method,
                 f"block_{i}: _replace_quant_method was never called",
             )
-            self.assertIsInstance(
-                expert.installed_method, _FakeTurboQuantFusedMoEMethod
-            )
+            self.assertIsInstance(expert.installed_method, _FakeTurboQuantFusedMoEMethod)
 
     def test_walker_attaches_compressed_tensors(self):
         model = self._build_model(n_layers=2)
@@ -260,9 +257,7 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
                 pool.w13.data_ptr(),
                 f"block_{i} w13_weight.data must alias the shared scratch buffer",
             )
-            self.assertEqual(
-                expert.w2_weight.data.data_ptr(), pool.w2.data_ptr()
-            )
+            self.assertEqual(expert.w2_weight.data.data_ptr(), pool.w2.data_ptr())
 
     def test_walker_shares_scratch_pool_across_layers(self):
         """Scratch pool must be shared across every FusedMoE in the model.
@@ -275,10 +270,7 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
         model = self._build_model(n_layers=3)
         _replace_linear_layers(model, bits=3, group_size=128)
 
-        pools = {
-            id(getattr(model, f"block_{i}").installed_method.scratch_pool)
-            for i in range(3)
-        }
+        pools = {id(getattr(model, f"block_{i}").installed_method.scratch_pool) for i in range(3)}
         self.assertEqual(
             len(pools),
             1,
@@ -309,8 +301,7 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
         self.assertGreater(
             ratio,
             4.0,
-            f"TQ3 compression ratio {ratio:.2f}× is suspiciously low "
-            "(should be around 5× for bf16 → 3-bit)",
+            f"TQ3 compression ratio {ratio:.2f}× is suspiciously low (should be around 5× for bf16 → 3-bit)",
         )
 
 

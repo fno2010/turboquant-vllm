@@ -17,12 +17,8 @@ class FakeFusedMoELayer(nn.Module):
 
     def __init__(self, num_experts: int, out_dim: int, in_dim: int):
         super().__init__()
-        self.w13_weight = nn.Parameter(
-            torch.zeros(num_experts, 2 * out_dim, in_dim), requires_grad=False
-        )
-        self.w2_weight = nn.Parameter(
-            torch.zeros(num_experts, in_dim, out_dim), requires_grad=False
-        )
+        self.w13_weight = nn.Parameter(torch.zeros(num_experts, 2 * out_dim, in_dim), requires_grad=False)
+        self.w2_weight = nn.Parameter(torch.zeros(num_experts, in_dim, out_dim), requires_grad=False)
         # Attach weight_loaders that do expert assembly
         self.w13_weight.weight_loader = self._make_expert_loader("w13_weight")
         self.w2_weight.weight_loader = self._make_expert_loader("w2_weight")
@@ -34,9 +30,7 @@ class FakeFusedMoELayer(nn.Module):
                     param.data[expert_id, : loaded_weight.shape[0]] = loaded_weight
                 else:  # up
                     offset = param.shape[1] // 2
-                    param.data[expert_id, offset : offset + loaded_weight.shape[0]] = (
-                        loaded_weight
-                    )
+                    param.data[expert_id, offset : offset + loaded_weight.shape[0]] = loaded_weight
             else:
                 param.data[expert_id] = loaded_weight
 
@@ -91,15 +85,9 @@ class TestMoEBuffering(unittest.TestCase):
             gate = torch.randn(8, 16)
             up = torch.randn(8, 16)
             down = torch.randn(16, 8)
-            layer.w13_weight.weight_loader(
-                layer.w13_weight, gate, expert_id=expert_id, shard_id="gate"
-            )
-            layer.w13_weight.weight_loader(
-                layer.w13_weight, up, expert_id=expert_id, shard_id="up"
-            )
-            layer.w2_weight.weight_loader(
-                layer.w2_weight, down, expert_id=expert_id
-            )
+            layer.w13_weight.weight_loader(layer.w13_weight, gate, expert_id=expert_id, shard_id="gate")
+            layer.w13_weight.weight_loader(layer.w13_weight, up, expert_id=expert_id, shard_id="up")
+            layer.w2_weight.weight_loader(layer.w2_weight, down, expert_id=expert_id)
 
         # Verify
         self.assertEqual(loaded_numel[0], total_numel)
@@ -132,15 +120,9 @@ class TestMoEBuffering(unittest.TestCase):
 
         # Load only 2 of 4 experts
         for expert_id in range(2):
-            layer.w13_weight.weight_loader(
-                layer.w13_weight, torch.randn(8, 16), expert_id=expert_id, shard_id="gate"
-            )
-            layer.w13_weight.weight_loader(
-                layer.w13_weight, torch.randn(8, 16), expert_id=expert_id, shard_id="up"
-            )
-            layer.w2_weight.weight_loader(
-                layer.w2_weight, torch.randn(16, 8), expert_id=expert_id
-            )
+            layer.w13_weight.weight_loader(layer.w13_weight, torch.randn(8, 16), expert_id=expert_id, shard_id="gate")
+            layer.w13_weight.weight_loader(layer.w13_weight, torch.randn(8, 16), expert_id=expert_id, shard_id="up")
+            layer.w2_weight.weight_loader(layer.w2_weight, torch.randn(16, 8), expert_id=expert_id)
 
         self.assertFalse(fired[0])
         self.assertLess(loaded_numel[0], total_numel)

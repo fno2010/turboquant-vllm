@@ -73,9 +73,7 @@ def _upstream_solve_lloyd_max(
     centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
 
     for _ in range(max_iter):
-        boundaries = [
-            (centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)
-        ]
+        boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)]
         edges = [lo * 3] + boundaries + [hi * 3]
         new_centroids = []
         for i in range(n_levels):
@@ -162,9 +160,7 @@ class TestOurCentroidsAreSortedAndSymmetric(unittest.TestCase):
         for d in (64, 128, 256):
             for bits in (2, 3, 4):
                 c = _our_optimal_centroids(bits, d)
-                self.assertEqual(
-                    len(c), 2**bits, f"level count wrong at d={d} bits={bits}"
-                )
+                self.assertEqual(len(c), 2**bits, f"level count wrong at d={d} bits={bits}")
 
     def test_approximately_symmetric(self):
         """Centroids should be symmetric around 0 for a centered Gaussian source."""

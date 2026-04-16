@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -152,9 +151,9 @@ def main() -> int:
 
     # FWHT-on-input: one forward WHT on the input instead of N inverse
     # WHTs on the weight rows. Pre-unpack indices once at init time.
-    indices_grouped = unpack_indices_3bit_mlx(
-        mx.array(packed.numpy()), dim=in_features
-    ).reshape(out_features * n_groups, group_size)
+    indices_grouped = unpack_indices_3bit_mlx(mx.array(packed.numpy()), dim=in_features).reshape(
+        out_features * n_groups, group_size
+    )
     mx.eval(indices_grouped)
     norms_mx = mx.array(norms.numpy())
 
@@ -162,9 +161,7 @@ def main() -> int:
         out = fwht_on_input_matmul_mlx(x_mx, indices_grouped, norms_mx, state)
         mx.eval(out)
 
-    compiled_fwht = mx.compile(
-        lambda x: fwht_on_input_matmul_mlx(x, indices_grouped, norms_mx, state)
-    )
+    compiled_fwht = mx.compile(lambda x: fwht_on_input_matmul_mlx(x, indices_grouped, norms_mx, state))
 
     def run_mlx_fwht_compiled():
         out = compiled_fwht(x_mx)
@@ -190,7 +187,7 @@ def main() -> int:
     EVAL_TOKENS = 25000
     ms_to_min = LINEARS_PER_TOK_MOE_30B * EVAL_TOKENS / 1000 / 60
     print(
-        f"\n  Hypothetical 30B-MoE 20-scenario eval (~{EVAL_TOKENS//1000}k tok, "
+        f"\n  Hypothetical 30B-MoE 20-scenario eval (~{EVAL_TOKENS // 1000}k tok, "
         f"~{LINEARS_PER_TOK_MOE_30B} Linear calls/tok):\n"
         f"    PyTorch CPU:  ~{pt_ms * ms_to_min:.0f} minutes\n"
         f"    MLX native:   ~{mlx_ms * ms_to_min:.0f} minutes\n"

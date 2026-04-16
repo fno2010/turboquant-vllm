@@ -21,7 +21,6 @@ CPU-only; no Triton, no CUDA, no vLLM.
 
 import unittest
 
-import torch
 import torch.nn as nn
 
 
@@ -101,8 +100,7 @@ class TestEagerRotationMatrixCache(unittest.TestCase):
         (mat,) = list(self._cache.values())[:1]
         self.assertTrue(
             mat.is_contiguous(),
-            "cached rotation matrix must be contiguous — downstream "
-            "Triton kernels assume contiguous strides",
+            "cached rotation matrix must be contiguous — downstream Triton kernels assume contiguous strides",
         )
 
 

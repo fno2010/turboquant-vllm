@@ -377,6 +377,21 @@ class TurboQuantWrapper(nn.Module):
         wrapper.register_buffer("norms", norms)
         wrapper.bias = nn.Parameter(bias) if bias is not None else None
 
+        # `from_packed` is invoked by `load_tq3_model`, which builds an HF
+        # transformers model — not a vLLM Linear subclass. Plain HF Linear
+        # returns a tensor, not a (tensor, bias) tuple, so return_bias=False.
+        wrapper.return_bias = False
+
+        # Mirror __init__: cache PolarQuant rotation tensors as buffers so
+        # forward() can read them directly without dict lookup. Centroids
+        # and signs are deterministic from (group_size, bits, device).
+        _ensure_triton_backends()
+        _get_cuda_module()
+        _pq = _get_quantizer(group_size, bits, str(packed_weight.device))
+        wrapper.register_buffer("tq_signs1", _pq.signs1)
+        wrapper.register_buffer("tq_signs2", _pq.signs2)
+        wrapper.register_buffer("tq_centroids", _pq.centroids)
+
         original_bytes = out_features * in_features * 2  # FP16 equivalent
         compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
         wrapper._ratio = original_bytes / max(compressed_bytes, 1)

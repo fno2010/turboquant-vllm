@@ -62,19 +62,18 @@ class TestCheckpointMoERoundTrip(unittest.TestCase):
             json.dump({"tokenizer_class": "PreTrainedTokenizerFast"}, f)
         # Write a minimal tokenizer.json
         with open(os.path.join(ckpt_dir, "tokenizer.json"), "w") as f:
-            json.dump({
-                "version": "1.0",
-                "model": {"type": "BPE", "vocab": {"<s>": 0, "</s>": 1}, "merges": []},
-                "added_tokens": [],
-            }, f)
+            json.dump(
+                {
+                    "version": "1.0",
+                    "model": {"type": "BPE", "vocab": {"<s>": 0, "</s>": 1}, "merges": []},
+                    "added_tokens": [],
+                },
+                f,
+            )
 
         # Expert weights as 3D tensors (simulates FusedMoE fused format)
-        w13 = torch.randn(
-            self.num_experts, 2 * self.intermediate, self.hidden, dtype=torch.float32
-        )
-        w2 = torch.randn(
-            self.num_experts, self.hidden, self.intermediate, dtype=torch.float32
-        )
+        w13 = torch.randn(self.num_experts, 2 * self.intermediate, self.hidden, dtype=torch.float32)
+        w2 = torch.randn(self.num_experts, self.hidden, self.intermediate, dtype=torch.float32)
         # Also a non-weight tensor that should NOT be compressed
         embed = torch.randn(100, self.hidden, dtype=torch.float32)
 
@@ -167,7 +166,8 @@ class TestCheckpointMoERoundTrip(unittest.TestCase):
         # TQ3 on unit-variance Gaussian data: typical max error < 1.0
         max_diff = (orig_w13 - out_w13).abs().max().item()
         self.assertLess(
-            max_diff, 2.0,
+            max_diff,
+            2.0,
             f"w13 roundtrip max diff {max_diff:.3f} too large for TQ3",
         )
 

@@ -15,12 +15,8 @@ class FakeFusedMoE(nn.Module):
 
     def __init__(self, num_experts: int, out_dim: int, in_dim: int):
         super().__init__()
-        w13 = nn.Parameter(
-            torch.zeros(num_experts, 2 * out_dim, in_dim), requires_grad=False
-        )
-        w2 = nn.Parameter(
-            torch.zeros(num_experts, in_dim, out_dim), requires_grad=False
-        )
+        w13 = nn.Parameter(torch.zeros(num_experts, 2 * out_dim, in_dim), requires_grad=False)
+        w2 = nn.Parameter(torch.zeros(num_experts, in_dim, out_dim), requires_grad=False)
         self.register_parameter("w13_weight", w13)
         self.register_parameter("w2_weight", w2)
 
@@ -87,6 +83,7 @@ class TestMoEReplay(unittest.TestCase):
                 numel = loaded.numel() if isinstance(loaded, torch.Tensor) else 0
                 buffer.append((pname, args, kwargs))
                 loaded_numel[0] += numel
+
             return _buf
 
         for name, param in layer.named_parameters(recurse=False):
@@ -102,15 +99,9 @@ class TestMoEReplay(unittest.TestCase):
             expert_data[expert_id] = (gate, up, down)
 
             # These calls go through _buffering_loader
-            layer.w13_weight.weight_loader(
-                layer.w13_weight, gate, expert_id=expert_id, shard_id="gate"
-            )
-            layer.w13_weight.weight_loader(
-                layer.w13_weight, up, expert_id=expert_id, shard_id="up"
-            )
-            layer.w2_weight.weight_loader(
-                layer.w2_weight, down, expert_id=expert_id
-            )
+            layer.w13_weight.weight_loader(layer.w13_weight, gate, expert_id=expert_id, shard_id="gate")
+            layer.w13_weight.weight_loader(layer.w13_weight, up, expert_id=expert_id, shard_id="up")
+            layer.w2_weight.weight_loader(layer.w2_weight, down, expert_id=expert_id)
 
         self.assertEqual(loaded_numel[0], total_numel)
         self.assertEqual(len(buffer), 12)

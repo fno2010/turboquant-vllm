@@ -21,7 +21,6 @@ import torch
 from turboquant_vllm.weight_quant import (
     Compressed3D,
     packed_group_bytes,
-    pack_indices,
 )
 
 
@@ -61,9 +60,7 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
         comp_a = Compressed3D(data, bits=bits, group_size=gs)
         ref = comp_a.decompress()
 
-        comp_b = Compressed3D.from_packed(
-            comp_a.packed, comp_a.norms, data.shape, data.dtype, bits, gs
-        )
+        comp_b = Compressed3D.from_packed(comp_a.packed, comp_a.norms, data.shape, data.dtype, bits, gs)
         out_b = comp_b.decompress()
 
         self.assertEqual(ref.shape, out_b.shape)
@@ -81,9 +78,7 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
         comp = Compressed3D(data, bits=bits, group_size=gs)
         ref = comp.decompress()
 
-        comp2 = Compressed3D.from_packed(
-            comp.packed, comp.norms, data.shape, data.dtype, bits, gs
-        )
+        comp2 = Compressed3D.from_packed(comp.packed, comp.norms, data.shape, data.dtype, bits, gs)
         buf = torch.empty_like(ref)
         comp2.decompress_into(buf)
 
@@ -99,9 +94,7 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
         comp = Compressed3D(data, bits=bits, group_size=gs)
         ref = comp.decompress()
 
-        comp2 = Compressed3D.from_packed(
-            comp.packed, comp.norms, data.shape, data.dtype, bits, gs
-        )
+        comp2 = Compressed3D.from_packed(comp.packed, comp.norms, data.shape, data.dtype, bits, gs)
         out = comp2.decompress()
         self.assertTrue(torch.allclose(ref, out))
 
@@ -128,10 +121,12 @@ class TestNativeMoELoaderShapes(unittest.TestCase):
         expected_packed = (num_experts * out_dim, n_groups * pgb)
         expected_norms = (num_experts * out_dim, n_groups)
 
-        self.assertEqual(comp.packed.shape, expected_packed,
-                         f"packed shape mismatch: {comp.packed.shape} vs {expected_packed}")
-        self.assertEqual(comp.norms.shape, expected_norms,
-                         f"norms shape mismatch: {comp.norms.shape} vs {expected_norms}")
+        self.assertEqual(
+            comp.packed.shape, expected_packed, f"packed shape mismatch: {comp.packed.shape} vs {expected_packed}"
+        )
+        self.assertEqual(
+            comp.norms.shape, expected_norms, f"norms shape mismatch: {comp.norms.shape} vs {expected_norms}"
+        )
 
 
 class TestDecompressDetection(unittest.TestCase):
@@ -139,7 +134,9 @@ class TestDecompressDetection(unittest.TestCase):
 
     def test_tq_config_triggers_decompress(self):
         """Checkpoint with tq_config.json should activate decompression."""
-        import tempfile, json
+        import tempfile
+        import json
+
         d = tempfile.mkdtemp()
         with open(os.path.join(d, "tq_config.json"), "w") as f:
             json.dump({"format": "tq3_native", "bits": 3, "group_size": 128}, f)
@@ -148,6 +145,7 @@ class TestDecompressDetection(unittest.TestCase):
     def test_no_tq_config_skips_decompress(self):
         """Checkpoint without tq_config.json should NOT decompress."""
         import tempfile
+
         d = tempfile.mkdtemp()
         self.assertFalse(os.path.isfile(os.path.join(d, "tq_config.json")))
 
