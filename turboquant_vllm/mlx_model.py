@@ -149,14 +149,14 @@ class TurboQuantMLXSwitchLinear(nn.Module):
         self.padded_in, self.n_groups = padded_size(in_features, self.group_size)
         self._pad_needed = self.padded_in > in_features
 
-        self.packed_weight = packed_weight
         self.norms = norms.reshape(num_experts, out_features, self.n_groups)
 
-        # Pre-unpack once. Shape (num_experts, out_features, n_groups, group_size).
-        unpacked = unpack_indices_3bit_mlx(packed_weight, dim=self.padded_in).reshape(
-            num_experts * out_features * self.n_groups, self.group_size
-        )
-        self._indices_grouped = unpacked.reshape(num_experts, out_features, self.n_groups, self.group_size)
+        # Keep packed uint8 — do NOT pre-unpack to int32. For 256-expert
+        # models the int32 blowup is ~1 GB per SwitchLinear (120 GB total
+        # for 35B). Instead reshape packed so axis 0 is per-expert and we
+        # can gather only the active experts per forward.
+        bytes_per_group = packed_weight.shape[-1]
+        self._packed_per_expert = packed_weight.reshape(num_experts, out_features * self.n_groups, bytes_per_group)
 
     def __call__(
         self,
@@ -183,10 +183,16 @@ class TurboQuantMLXSwitchLinear(nn.Module):
         # dequant the same expert — acceptable trade-off to avoid a
         # host-side unique() sync that MLX doesn't support natively.
         ids_flat = indices.reshape(-1)
-        active_idx_grouped = mx.take(self._indices_grouped, ids_flat, axis=0)
-        active_norms = mx.take(self.norms, ids_flat, axis=0)
 
-        w = self.quant_state.centroids[active_idx_grouped]
+        # Gather packed uint8 for active experts, unpack on the fly.
+        active_packed = mx.take(self._packed_per_expert, ids_flat, axis=0)
+        active_unpacked = unpack_indices_3bit_mlx(
+            active_packed.reshape(-1, active_packed.shape[-1]),
+            dim=self.padded_in,
+        ).reshape(ids_flat.size, self.out_features, self.n_groups, self.group_size)
+
+        active_norms = mx.take(self.norms, ids_flat, axis=0)
+        w = self.quant_state.centroids[active_unpacked]
         w = w * active_norms[:, :, :, None]
         w = w.reshape(ids_flat.size, self.out_features, self.padded_in).astype(x.dtype)
 

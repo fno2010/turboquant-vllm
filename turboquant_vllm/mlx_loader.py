@@ -334,8 +334,15 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
             unresolved_packed,
         )
 
+    del weights
     model.eval()
     model.load_weights(remaining, strict=False)
+
+    # Pin parameters in resident memory. With packed uint8 storage
+    # (no pre-unpack to int32), the total resident set is ~15-16 GB
+    # for a 35B MoE — well within 48 GB unified memory. Without
+    # eval, MLX keeps arrays as mmap'd lazily and every forward
+    # page-faults from SSD (→ 1 tok/s).
     mx.eval(model.parameters())
 
     return model, config
