@@ -3,6 +3,7 @@
 Model compression for vLLM. What this package ships today:
 
 - **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in seconds, zero calibration. Algorithm is the scalar case of HIGGS; see "How it works" below.
+- **bs=1 CUDA GEMV kernel** (v0.9.0) for TQ3 Linear layers: warp-per-output-channel, sm_80+, bf16. Triton's GEMV pads M=1 up to the tensor-core tile and wastes most of the ALU at batch size 1; this kernel replaces that path through a runtime-dispatching custom op so CUDA graphs capture the right path per batch size. Measured **2.12x decode speedup over the Triton-only path** on Qwen3-8B A100 bs=1. Motivation in [When Triton Stops Being the Right Tool](https://varjosoft.com/when-triton-stops).
 - **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada) and large-model deployments (GLM-5.1 754B on 2×H200). MoE expert regrouping handled automatically.
 - **MLX port for Apple Silicon** — loads TQ3 checkpoints through `mlx-lm` on Mac (dense + MoE). Qwen2.5-0.5B at 26 tok/s, Granite-1B MoE at 84 tok/s, Qwen3.5-35B (256 experts) fits in 19 GB on a 48 GB MacBook. [Write-up](https://varjosoft.com/70gb-on-48gb-mac.html).
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
