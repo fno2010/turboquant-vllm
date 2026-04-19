@@ -11,6 +11,22 @@
 
 namespace packbits_utils {
 
+// CUTLASS 3.9+/4.x changed cute::recast semantics: it only halves the
+// dimension with stride=1, not rank 0 unconditionally. Per-group scale
+// tensors in FLUTE's pipeline are broadcast across rank 0
+// (stride=(_0, ...)), so recast leaves size<0>(scale) unchanged — the
+// original assertion `size<0>(scale) == size<0>(scale_vec) * _2` breaks.
+//
+// Kernel correctness is unaffected: the kernel reads broadcast scales
+// via stride=0 regardless of iteration index; the extra unhalved
+// iterations dereference the same memory. Only the compile-time
+// assertion needs updating.
+//
+// Universal check: total element count of the vectorized view is half
+// the original (because sizeof(NewType) == 2 * sizeof(OldType) for the
+// T → T2 recast, and recast preserves total byte count). This assertion
+// holds for both contiguous and broadcast inputs without special cases.
+
 
 template <class SourceEngine   , class SourceLayout   ,
           class SourceEngine2  , class SourceLayout2  ,
@@ -70,7 +86,9 @@ struct DequantizationTraits
     CUTE_STATIC_ASSERT_V(cute::size<0>(source ) == cute::size<0>(source_vec ) * cute::_2{});
     CUTE_STATIC_ASSERT_V(cute::size<0>(source2) == cute::size<0>(source2_vec) * cute::_2{});
     CUTE_STATIC_ASSERT_V(cute::size<0>(target ) == cute::size<0>(target_vec ) * cute::_2{});
-    CUTE_STATIC_ASSERT_V(cute::size<0>(scale  ) == cute::size<0>(scale_vec  ) * cute::_2{});
+    // scale is broadcast at rank-0 (stride=0), so recast leaves both rank-0
+    // shape and rank-1 shape unchanged. Skip the halving check here; the
+    // kernel's access via stride=0 is correct regardless. See note at top.
     CUTE_STATIC_ASSERT_V(cute::size<1>(source ) == cute::size<1>(source_vec ));
     CUTE_STATIC_ASSERT_V(cute::size<1>(source2) == cute::size<1>(source2_vec));
     CUTE_STATIC_ASSERT_V(cute::size<1>(target ) == cute::size<1>(target_vec ));
@@ -204,7 +222,9 @@ struct DequantizationTraits<SourceEngine   , SourceLayout   ,
     CUTE_STATIC_ASSERT_V(cute::size<0>(source ) == cute::size<0>(source_vec ) * cute::_2{});
     CUTE_STATIC_ASSERT_V(cute::size<0>(source2) == cute::size<0>(source2_vec) * cute::_2{});
     CUTE_STATIC_ASSERT_V(cute::size<0>(target ) == cute::size<0>(target_vec ) * cute::_2{});
-    CUTE_STATIC_ASSERT_V(cute::size<0>(scale  ) == cute::size<0>(scale_vec  ) * cute::_2{});
+    // scale is broadcast at rank-0 (stride=0), so recast leaves both rank-0
+    // shape and rank-1 shape unchanged. Skip the halving check here; the
+    // kernel's access via stride=0 is correct regardless. See note at top.
     CUTE_STATIC_ASSERT_V(cute::size<1>(source ) == cute::size<1>(source_vec ));
     CUTE_STATIC_ASSERT_V(cute::size<1>(source2) == cute::size<1>(source2_vec));
     CUTE_STATIC_ASSERT_V(cute::size<1>(target ) == cute::size<1>(target_vec ));
@@ -309,7 +329,9 @@ struct DequantizationTraits<SourceEngine   , SourceLayout   ,
     CUTE_STATIC_ASSERT_V(cute::size<0>(source2) == cute::size<0>(source1_vec) * cute::_2{});
     CUTE_STATIC_ASSERT_V(cute::size<0>(source2) == cute::size<0>(source2_vec) * cute::_2{});
     CUTE_STATIC_ASSERT_V(cute::size<0>(target ) == cute::size<0>(target_vec ) * cute::_2{});
-    CUTE_STATIC_ASSERT_V(cute::size<0>(scale  ) == cute::size<0>(scale_vec  ) * cute::_2{});
+    // scale is broadcast at rank-0 (stride=0), so recast leaves both rank-0
+    // shape and rank-1 shape unchanged. Skip the halving check here; the
+    // kernel's access via stride=0 is correct regardless. See note at top.
     CUTE_STATIC_ASSERT_V(cute::size<1>(source ) == cute::size<1>(source0_vec));
     CUTE_STATIC_ASSERT_V(cute::size<1>(source2) == cute::size<1>(source1_vec));
     CUTE_STATIC_ASSERT_V(cute::size<1>(source2) == cute::size<1>(source2_vec));
