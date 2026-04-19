@@ -15,11 +15,11 @@ from bitsandbytes.nn import (
 from typing import Optional, Dict
 
 from turboquant_vllm import flute
-import turboquant_vllm.flute.tune
-import turboquant_vllm.flute.utils
-import turboquant_vllm.flute.nf_utils
-import turboquant_vllm.flute.integrations.bitsandbytes
-from turboquant_vllm.flute.integrations.learnable import LearnableQuantizedLinear
+import flute.tune
+import flute.utils
+import flute.nf_utils
+import flute.integrations.bitsandbytes
+from flute.integrations.learnable import LearnableQuantizedLinear
 
 FLUTE_CONFIG_FILE_NAME = "flute_config.json"
 

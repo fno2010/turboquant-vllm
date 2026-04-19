@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from typing import Optional
 
 from turboquant_vllm import flute
-import turboquant_vllm.flute.nf_utils
+import flute.nf_utils
 
 class LearnableQuantizedLinear(torch.nn.Module):
     in_features : int

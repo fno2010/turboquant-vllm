@@ -16,7 +16,7 @@ from transformers.quantizers.auto import (
     AUTO_QUANTIZER_MAPPING,
     AUTO_QUANTIZATION_CONFIG_MAPPING)
 
-from turboquant_vllm.flute.integrations.base import FLUTE_CONFIG_FILE_NAME
+from flute.integrations.base import FLUTE_CONFIG_FILE_NAME
 
 logger = logging.get_logger(__name__)
 
@@ -92,7 +92,7 @@ def _replace_with_flute_linear(
     pre_quantized: bool = False,
 ) -> Tuple[torch.nn.Module, bool]:
     from accelerate import init_empty_weights
-    from turboquant_vllm.flute.integrations.base import FluteLinear
+    from flute.integrations.base import FluteLinear
 
     if current_key_name is None:
         current_key_name = []
@@ -171,9 +171,9 @@ def replace_with_flute_linear(
 
 
 def _repack_flute_linear(model: torch.nn.Module, quantization_config: FluteConfig) -> None:
-    import turboquant_vllm.flute.tune
-    import turboquant_vllm.flute.utils
-    from turboquant_vllm.flute.integrations.base import FluteLinear
+    import flute.tune
+    import flute.utils
+    from flute.integrations.base import FluteLinear
 
     for name, module in model.named_children():
 

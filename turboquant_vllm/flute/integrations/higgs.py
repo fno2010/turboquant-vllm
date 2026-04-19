@@ -1,7 +1,7 @@
 import torch
 import warnings
-import turboquant_vllm.flute.tune
-import turboquant_vllm.flute.utils
+import flute.tune
+import flute.utils
 from typing import Tuple, Optional
 
 

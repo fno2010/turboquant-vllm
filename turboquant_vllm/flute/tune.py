@@ -7,7 +7,7 @@ from collections import defaultdict
 from typing import Tuple, Dict, List, Optional, NamedTuple
 
 from turboquant_vllm import flute
-import turboquant_vllm.flute.utils
+import flute.utils
 
 _TEMPLATES = {}
 FP16_ERROR_THRESHOLD = 2.0e-3

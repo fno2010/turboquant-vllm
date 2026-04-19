@@ -16,7 +16,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 
 from turboquant_vllm import flute
-import turboquant_vllm.flute.utils
+import flute.utils
 
 
 # TODO: check this
