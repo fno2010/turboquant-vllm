@@ -29,6 +29,7 @@ from turboquant_vllm.mlx_metal_kernels import (
     tq3_gemv_bs1_batched_mlx,
     tq3_gemv_bs1_batched_per_x_mlx,
     tq3_gemv_bs1_mlx,
+    tq3_gemv_bs1_moe_fused_mlx,
     tq4_gemv_bs1_batched_mlx,
     tq4_gemv_bs1_batched_per_x_mlx,
     tq4_gemv_bs1_mlx,
@@ -219,26 +220,36 @@ class TurboQuantMLXSwitchLinear(nn.Module):
             x, self.quant_state.signs1, self.quant_state.signs2, self.n_groups, self.group_size
         ).reshape(*x.shape[:-1], self.padded_in)
 
-        ids_flat = indices.reshape(-1)
-        active_packed = mx.take(self._packed_per_expert, ids_flat, axis=0)
-        active_norms = mx.take(self.norms, ids_flat, axis=0)
-
-        # bs=1 fp16 fast path: batched custom Metal GEMV across active experts.
-        # Skips the full ``(K_active, OC, K)`` weight materialisation that the
-        # einsum path requires, fusing 3-bit unpack + codebook + norm + matmul
-        # into one kernel call per Linear.
-        # Two cases:
-        #   (a) shared-x: gate/up_proj — same activation goes to every expert.
-        #       x has shape (1, 1, 1, K), x_rot.size == padded_in.
-        #   (b) per-expert-x: down_proj — each expert sees its own activation.
-        #       x has shape (1, K_active, 1, K), x_rot.size == K_active * padded_in.
-        # bs=1 fused Metal GEMV fast path — dispatch on state.bits (3 or 4).
-        # Each of the two variants (shared-x and per-expert-x) has TQ3 and
-        # TQ4 kernels. 4-bit packed is 64 bytes/group, 3-bit is 48.
+        ids_flat = indices.reshape(-1).astype(mx.uint32)
         K_active = ids_flat.size
         use_fast_path = (
             x.dtype == mx.float16 and self.quant_state.bits in (3, 4)
         )
+
+        # TQ3 shared-x fused-gather: gate_proj / up_proj path with
+        # fused kernel that indexes into _packed_per_expert directly,
+        # skipping the 400 µs/call mx.take overhead.
+        if (
+            use_fast_path
+            and self.quant_state.bits == 3
+            and x_rot.size == self.padded_in
+        ):
+            x_rot_flat = x_rot.reshape(self.padded_in).astype(mx.float16)
+            out_flat = tq3_gemv_bs1_moe_fused_mlx(
+                x_rot_flat,
+                self._packed_per_expert,
+                self.norms.astype(mx.float16),
+                self.quant_state.centroids.astype(mx.float16),
+                ids_flat,
+            )
+            if self.bias is not None:
+                out_flat = out_flat + mx.take(self.bias, ids_flat, axis=0).astype(mx.float16)
+            return out_flat.reshape(*indices.shape, 1, self.out_features)
+
+        # Legacy two-step gather + batched kernel (TQ4, per-expert-x, or fallback).
+        active_packed = mx.take(self._packed_per_expert, ids_flat, axis=0)
+        active_norms = mx.take(self.norms, ids_flat, axis=0)
+
         if use_fast_path and x_rot.size == self.padded_in:
             x_rot_flat = x_rot.reshape(self.padded_in).astype(mx.float16)
             gemv = (
