@@ -42,6 +42,19 @@ class PolarQuantStateMLX:
             p <<= 1
         return p
 
+    @property
+    def bits(self) -> int:
+        """Inferred bit width from centroid count. 8→3-bit, 16→4-bit, 32→5-bit."""
+        n = self.centroids.shape[0]
+        # len is a power of 2 by construction; log2 gives the bit width
+        if n == 8:
+            return 3
+        if n == 16:
+            return 4
+        if n == 32:
+            return 5
+        raise ValueError(f"unexpected centroid count {n}")
+
     @classmethod
     def from_torch_quantizer(cls, pq) -> "PolarQuantStateMLX":
         """Convert a ``PolarQuantTorch`` instance into MLX-side state."""
@@ -115,6 +128,34 @@ def unpack_indices_3bit_mlx(packed: mx.array, dim: int) -> mx.array:
     unpacked = mx.stack([v0, v1, v2, v3, v4, v5, v6, v7], axis=-1)
     unpacked = unpacked.reshape(n_rows, n_groups_of_3 * 8)
     return unpacked[:, :dim].astype(mx.uint8)
+
+
+def unpack_indices_4bit_mlx(packed: mx.array, dim: int) -> mx.array:
+    """Unpack 4-bit indices from uint8 into uint8 (values 0-15).
+
+    Layout: 2 values per byte, low nibble first (matches
+    ``weight_quant._pack_indices`` bits=4 path: ``lo | (hi << 4)``).
+    """
+    n_rows, n_packed = packed.shape
+    p = packed.astype(mx.int32)
+    lo = p & 0x0F
+    hi = (p >> 4) & 0x0F
+    # Interleave lo[i], hi[i] to restore original sequence
+    unpacked = mx.stack([lo, hi], axis=-1).reshape(n_rows, n_packed * 2)
+    return unpacked[:, :dim].astype(mx.uint8)
+
+
+def unpack_indices_mlx(packed: mx.array, bits: int, dim: int) -> mx.array:
+    """Dispatch unpack by bit width. Extends naturally when TQ5/TQ2 add.
+
+    For TQ3 (bits=3): 48 bytes per 128-element group.
+    For TQ4 (bits=4): 64 bytes per 128-element group.
+    """
+    if bits == 3:
+        return unpack_indices_3bit_mlx(packed, dim)
+    if bits == 4:
+        return unpack_indices_4bit_mlx(packed, dim)
+    raise ValueError(f"unpack_indices_mlx: unsupported bits={bits}; expected 3 or 4")
 
 
 def fwht_on_input_matmul_mlx(

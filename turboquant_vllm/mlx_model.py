@@ -34,7 +34,7 @@ from turboquant_vllm.mlx_ops import (
     PolarQuantStateMLX,
     fwht_on_input_matmul_mlx,
     rht_on_last_dim_mlx,
-    unpack_indices_3bit_mlx,
+    unpack_indices_mlx,
 )
 from turboquant_vllm.weight_quant import padded_size
 
@@ -84,10 +84,12 @@ class TurboQuantMLXLinear(nn.Module):
         # Unpack the packed uint8 weights once at init — indices are immutable
         # and repeated unpacking on the hot path dominated early profiling.
         # Keep packed_weight too so introspection / reload paths can see it.
+        # Dispatch on state.bits so mixed-precision (TQ-apex) checkpoints work:
+        # a layer quantized at 4-bit ships 64 bytes/group, at 3-bit 48 bytes/group.
         self.packed_weight = packed_weight
-        self._indices_grouped = unpack_indices_3bit_mlx(packed_weight, dim=self.padded_in).reshape(
-            self.out_features * self.n_groups, self.group_size
-        )
+        self._indices_grouped = unpack_indices_mlx(
+            packed_weight, bits=state.bits, dim=self.padded_in,
+        ).reshape(self.out_features * self.n_groups, self.group_size)
 
     def __call__(self, x: mx.array) -> mx.array:
         orig_shape = x.shape
@@ -97,9 +99,13 @@ class TurboQuantMLXLinear(nn.Module):
         # full bf16/fp16 weight materialization that fwht_on_input_matmul_mlx
         # does, fusing 3-bit unpack + codebook lookup + norm + matmul into
         # one pass. 5-10x over the existing path on Qwen3-8B layer shapes.
+        # Kernel only supports 3-bit packing (48 bytes/group). For 4-bit
+        # TQ-apex layers we fall through to the generic path, which uses
+        # pre-unpacked uint8 indices and works for any bit width.
         if (
             x_flat.shape[0] == 1
             and x_flat.dtype == mx.float16
+            and self.quant_state.bits == 3
         ):
             x_padded = (
                 mx.pad(x_flat, [(0, 0), (0, self.padded_in - self.in_features)])
@@ -223,8 +229,11 @@ class TurboQuantMLXSwitchLinear(nn.Module):
         #       x has shape (1, 1, 1, K), x_rot.size == padded_in.
         #   (b) per-expert-x: down_proj — each expert sees its own activation.
         #       x has shape (1, K_active, 1, K), x_rot.size == K_active * padded_in.
+        # bs=1 fused Metal GEMV fast path. Both variants (shared-x and per-
+        # expert-x) are 3-bit-only — fall through to the generic dequant path
+        # for TQ-apex layers whose state is 4-bit.
         K_active = ids_flat.size
-        if x.dtype == mx.float16 and x_rot.size == self.padded_in:
+        if self.quant_state.bits == 3 and x.dtype == mx.float16 and x_rot.size == self.padded_in:
             x_rot_flat = x_rot.reshape(self.padded_in).astype(mx.float16)
             out_flat = tq3_gemv_bs1_batched_mlx(
                 x_rot_flat,
@@ -235,7 +244,7 @@ class TurboQuantMLXSwitchLinear(nn.Module):
             if self.bias is not None:
                 out_flat = out_flat + mx.take(self.bias, ids_flat, axis=0).astype(mx.float16)
             return out_flat.reshape(*indices.shape, 1, self.out_features)
-        if x.dtype == mx.float16 and x_rot.size == K_active * self.padded_in:
+        if self.quant_state.bits == 3 and x.dtype == mx.float16 and x_rot.size == K_active * self.padded_in:
             x_rot_per_k = x_rot.reshape(K_active, self.padded_in).astype(mx.float16)
             out_flat = tq3_gemv_bs1_batched_per_x_mlx(
                 x_rot_per_k,
@@ -247,9 +256,11 @@ class TurboQuantMLXSwitchLinear(nn.Module):
                 out_flat = out_flat + mx.take(self.bias, ids_flat, axis=0).astype(mx.float16)
             return out_flat.reshape(*indices.shape, 1, self.out_features)
 
-        # Fallback: full dequant + einsum (existing path).
-        active_unpacked = unpack_indices_3bit_mlx(
+        # Fallback: full dequant + einsum (existing path). Dispatch unpack on
+        # state.bits so TQ4 layers use the 4-bit nibble layout (2 values/byte).
+        active_unpacked = unpack_indices_mlx(
             active_packed.reshape(-1, active_packed.shape[-1]),
+            bits=self.quant_state.bits,
             dim=self.padded_in,
         ).reshape(ids_flat.size, self.out_features, self.n_groups, self.group_size)
 
