@@ -6,7 +6,8 @@ Model compression for vLLM. What this package ships today:
 - **bs=1 CUDA GEMV kernel** (v0.9.0) for TQ3 Linear layers: warp-per-output-channel, sm_80+, bf16. Triton's GEMV pads M=1 up to the tensor-core tile and wastes most of the ALU at batch size 1; this kernel replaces that path through a runtime-dispatching custom op so CUDA graphs capture the right path per batch size. Measured **2.12x decode speedup over the Triton-only path** on Qwen3-8B A100 bs=1. Motivation in [When Triton Stops Being the Right Tool](https://varjosoft.com/when-triton-stops).
 - **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada) and large-model deployments (GLM-5.1 754B on 2×H200). MoE expert regrouping handled automatically.
 - **MLX port for Apple Silicon** — loads TQ3 checkpoints through `mlx-lm` on Mac (dense + MoE). Qwen2.5-0.5B at 26 tok/s, Granite-1B MoE at 84 tok/s, Qwen3.5-35B (256 experts) fits in 19 GB on a 48 GB MacBook. [Write-up](https://varjosoft.com/70gb-on-48gb-mac.html).
-- **bs=1 Metal GEMV kernel** (v0.10.0) for TQ3 Linear + MoE SwitchLinear on Apple Silicon: SIMD-group-per-output-channel kernel via `mx.fast.metal_kernel`, fuses 3-bit unpack + codebook lookup + norm scaling + matmul into one pass. Three variants — single (dense), batched-shared-x (MoE gate/up_proj), batched-per-x (MoE down_proj). Microbench at Qwen3.5-35B-A3B-shape: **80–90× over the materialised-weight einsum path** on synthetic SwitchLinear; projected MoE-only ceiling **~16 tok/s on M4 Pro** (vs 1 tok/s baseline). Design study in [`.plans/higgs-metal-research.md`](https://github.com/varjoranta/verda-model-bench/blob/main/.plans/higgs-metal-research.md).
+- **bs=1 Metal GEMV kernel** (v0.10.0) for TQ3 Linear + MoE SwitchLinear on Apple Silicon: SIMD-group-per-output-channel kernel via `mx.fast.metal_kernel`, fuses 3-bit unpack + codebook lookup + norm scaling + matmul into one pass. Three variants — single (dense), batched-shared-x (MoE gate/up_proj), batched-per-x (MoE down_proj).
+- **Kurtosis-aware mixed-precision** (v0.11.0): per-tensor κ profile drives TQ3 / TQ4 / FP16 assignment per tensor family. On Qwen3.6-35B-A3B, the `varjosoft/Qwen3.6-35B-A3B-TQ-apex3` checkpoint (18 GB) hits **96.5 % gsm8k-200 — +2.0 ppt over `mlx-community/Qwen3.6-35B-A3B-4bit`** at 1 GB smaller on disk. Full mixed-bits loader + TQ4 Metal kernels ship in this release.
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
@@ -405,8 +406,48 @@ End-to-end results on M4 Pro 48 GB:
 | Qwen2.5-0.5B | Dense | 26 | 0.4 GB |
 | IBM Granite 1B-A400M | MoE (40 experts) | 84 | 2.5 GB |
 | Qwen3.5-35B-A3B | MoE (256 experts) | ~1 | 19 GB |
+| **Qwen3.6-35B-A3B-TQ-apex3** | MoE (256 experts) | **29** | **18 GB** |
 
-The 35B result is compute-bound, not memory-bound: the model fits (70 GB BF16 → 19 GB TQ3 resident), but ~440 unfused Metal kernel launches per token cap throughput at ~1 tok/s. Smaller models are fast because the per-kernel work dominates over launch overhead. Details: [varjosoft.com/70gb-on-48gb-mac.html](https://varjosoft.com/70gb-on-48gb-mac.html).
+### Kurtosis-aware mixed-precision (v0.11.0)
+
+Uniform TQ3 trades quality for size on MoE models with heavy-tailed tensors (router gates, gated-delta-net projections, shared-expert down-projections). `v0.11.0` ships **PAT-0349 kurtosis-aware bit-width selection** — compute per-tensor excess kurtosis (κ) once at compression time, then:
+
+- κ < 4 → **TQ3** (default, routed experts)
+- 4 ≤ κ < 8 → **TQ4** (attention Q/K/V/O, shared-expert gate/up)
+- κ ≥ 15 → **FP16** (router gates, GDN `in_proj_b`/`out_proj`/`linear_fc`, shared-expert `down_proj`)
+
+The mixed-bits MLX loader (`load_tq3`) handles all three precisions transparently — TQ3 goes through the 48-byte Metal kernel, TQ4 through a matching 64-byte nibble kernel, FP16 tensors pass through `mlx_lm`'s standard weight-load path.
+
+Result on Qwen3.6-35B-A3B, gsm8k-200 @ 1024 tok:
+
+| Checkpoint | Disk | gsm8k-200 | Decode (bs=1) |
+|---|---|---|---|
+| uniform TQ3-native | 16 GB | 85.5 % | 29 tok/s |
+| TQ-apex | 17 GB | 93.0 % | 29 tok/s |
+| TQ-apex2 | 18 GB | 96.0 % | 29 tok/s |
+| **TQ-apex3** | **18 GB** | **96.5 %** | **29 tok/s** |
+| `mlx-community/*-4bit` | 19 GB | 94.5 % | 73 tok/s |
+
+**Quality leader**: `varjosoft/Qwen3.6-35B-A3B-TQ-apex3` is the first TurboQuant checkpoint to beat the MLX-community 4-bit reference on accuracy, while being 1 GB smaller on disk. Speed on M4 Pro is capped at ~29 tok/s by the Lloyd-Max codebook lookup cost (measured floor ~54 µs/call at async steady state) — MLX's affine quantization is ~2× faster per kernel but ships at lower quality. This trade-off is fundamental to the codebook choice, not the kernel implementation.
+
+The 1 tok/s earlier result on Qwen3.5-35B-A3B was before the compiled `mx.compile` path + active-only expert dequant landed. The 29 tok/s apex3 number is the current steady-state.
+
+### Usage
+
+```bash
+pip install git+https://github.com/varjoranta/turboquant-vllm.git@feat/mixed-bits-mlx-loader
+huggingface-cli download varjosoft/Qwen3.6-35B-A3B-TQ-apex3 \
+    --local-dir ~/models/qwen3.6-35b-a3b-tq-apex3
+```
+
+```python
+from turboquant_vllm.mlx_loader import load_tq3
+from mlx_lm import generate
+model, tokenizer = load_tq3("~/models/qwen3.6-35b-a3b-tq-apex3")
+print(generate(model, tokenizer, "The capital of France is", max_tokens=64))
+```
+
+Or serve via OpenAI-compatible HTTP: `python examples/mac-serve-tq3.py --model ~/models/qwen3.6-35b-a3b-tq-apex3 --port 8080`.
 
 Key implementation choices:
 
