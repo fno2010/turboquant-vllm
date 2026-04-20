@@ -98,6 +98,118 @@ def _gemv_kernel():
     )
 
 
+# v2: register-pattern rewrite matching MLX's `qmv_fast_impl` — codebook in
+# per-thread registers (was threadgroup memory), results_per_simdgroup=4,
+# block_size=512. Details in .plans/tq3-metal-kernel-register-rewrite.md.
+# Requires OC % 8 == 0 (true for all quantized tensors in Qwen3.6-35B-A3B).
+_GEMV_V2_SOURCE = """
+    // --- Threadgroup / simdgroup positions
+    uint tid_y      = threadgroup_position_in_grid.y;   // row-group index [0, OC/8)
+    uint simd_gid   = simdgroup_index_in_threadgroup;   // 0 or 1
+    uint simd_lid   = thread_index_in_simdgroup;        // 0..31
+
+    // --- Compile-time constants (match MLX qmv_fast_impl for bits=3)
+    constexpr int pack_factor           = 8;
+    constexpr int bytes_per_pack        = 3;
+    constexpr int packs_per_thread      = 2;
+    constexpr int values_per_thread     = 16;   // packs_per_thread * pack_factor
+    constexpr int num_simdgroups        = 2;
+    constexpr int results_per_simdgroup = 4;
+    constexpr int block_size            = 512;  // values_per_thread * 32
+    constexpr int group_size            = 128;
+
+    uint OC_v       = OC[0];
+    uint n_groups_v = n_groups[0];
+    uint K_v        = n_groups_v * group_size;
+    uint in_vec_size_w = K_v * (uint)bytes_per_pack / (uint)pack_factor;  // = K*3/8
+
+    // --- Output row this simdgroup's 4 results start at
+    uint out_row = tid_y * (num_simdgroups * results_per_simdgroup)
+                 + simd_gid * results_per_simdgroup;  // +0 for simd 0, +4 for simd 1
+
+    // --- Codebook in thread-local array (Metal will place in registers
+    // when indices fit; spills to local memory for runtime-index fallback).
+    // Ternary cascade alternative benchmarked slower on M4 Pro (~2× overhead).
+    float cb_reg[8];
+    for (int i = 0; i < 8; i++) cb_reg[i] = float(codebook[i]);
+
+    // --- Thread-local x and per-row accumulators
+    float x_thread[values_per_thread];
+    float result[results_per_simdgroup];
+    for (int r = 0; r < results_per_simdgroup; r++) result[r] = 0.0f;
+
+    // --- Base pointers for this thread
+    // packed:  (OC, K*3/8) row-major, thread reads 6 bytes per iter at offset simd_lid*6
+    // norms:   (OC, n_groups) row-major, thread reads norm for its group (simd_lid/8)
+    // x_rot:   (K,), thread reads 16 values starting at simd_lid*16
+    device const uint8_t* ws = packed + out_row * in_vec_size_w + simd_lid * (uint)(packs_per_thread * bytes_per_pack);
+    device const half*    sp = norms  + out_row * n_groups_v + (simd_lid / 8);
+    device const half*    xp = x_rot  + simd_lid * (uint)values_per_thread;
+
+    // --- Main loop: iterate K in blocks of block_size=512 weights = 4 groups
+    uint n_iters = K_v / (uint)block_size;
+    for (uint it = 0; it < n_iters; it++) {
+        // Load 16 x values into registers
+        for (int i = 0; i < values_per_thread; i++) x_thread[i] = float(xp[i]);
+
+        // 4 output rows: each reads 6 bytes from its row and accumulates
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            device const uint8_t* wl = ws + row * in_vec_size_w;
+            float norm_val = float(sp[row * n_groups_v]);
+
+            float accum = 0.0f;
+            for (int p = 0; p < packs_per_thread; p++) {
+                uint b0 = (uint)wl[p * 3 + 0];
+                uint b1 = (uint)wl[p * 3 + 1];
+                uint b2 = (uint)wl[p * 3 + 2];
+                uint i0 =  b0                      & 0x7u;
+                uint i1 = (b0 >> 3)                & 0x7u;
+                uint i2 = ((b0 >> 6) | (b1 << 2))  & 0x7u;
+                uint i3 = (b1 >> 1)                & 0x7u;
+                uint i4 = (b1 >> 4)                & 0x7u;
+                uint i5 = ((b1 >> 7) | (b2 << 1))  & 0x7u;
+                uint i6 = (b2 >> 2)                & 0x7u;
+                uint i7 = (b2 >> 5)                & 0x7u;
+
+                int base = p * 8;
+                accum += cb_reg[i0] * x_thread[base + 0];
+                accum += cb_reg[i1] * x_thread[base + 1];
+                accum += cb_reg[i2] * x_thread[base + 2];
+                accum += cb_reg[i3] * x_thread[base + 3];
+                accum += cb_reg[i4] * x_thread[base + 4];
+                accum += cb_reg[i5] * x_thread[base + 5];
+                accum += cb_reg[i6] * x_thread[base + 6];
+                accum += cb_reg[i7] * x_thread[base + 7];
+            }
+            result[row] += norm_val * accum;
+        }
+
+        // Advance pointers to next block
+        ws += (uint)block_size * (uint)bytes_per_pack / (uint)pack_factor;  // +192
+        sp += (uint)block_size / (uint)group_size;                          // +4
+        xp += (uint)block_size;                                             // +512
+    }
+
+    // --- simd_sum reduction + output (first lane per simdgroup writes)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+        float r = simd_sum(result[row]);
+        if (simd_lid == 0u) {
+            out[out_row + row] = (half)r;
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _gemv_v2_kernel():
+    return mx.fast.metal_kernel(
+        name="tq3_gemv_bs1_mlx_v2",
+        input_names=["x_rot", "packed", "norms", "codebook", "OC", "n_groups"],
+        output_names=["out"],
+        source=_GEMV_V2_SOURCE,
+    )
+
+
 # MoE batched variant: same x_rot, but per-expert (packed, norms).
 # Grid z dim selects the active expert slot. Output shape (K_active, OC).
 _GEMV_BATCHED_SOURCE = """
@@ -375,6 +487,49 @@ def tq3_gemv_bs1_mlx(
         inputs=[x_rot, packed, norms, codebook, OC_arg, ng_arg],
         grid=(32, OC, 1),         # one SIMD-group per output channel
         threadgroup=(32, 1, 1),   # one SIMD-group per threadgroup
+        output_shapes=[(OC,)],
+        output_dtypes=[mx.float16],
+    )[0]
+    return out
+
+
+def tq3_gemv_bs1_mlx_v2(
+    x_rot: mx.array,
+    packed: mx.array,
+    norms: mx.array,
+    codebook: mx.array,
+) -> mx.array:
+    """Register-pattern bs=1 GEMV — port of MLX's qmv_fast_impl shape.
+
+    Requires ``OC % 8 == 0`` (8 outputs per threadgroup, 4 per simdgroup).
+    Takes the same row-major packed layout ``(OC * n_groups, 48)`` that
+    the v1 kernel uses — repacking happens implicitly via pointer math
+    (each output row of 48*n_groups bytes is contiguous, which is what
+    the v2 kernel walks).
+    """
+    assert x_rot.dtype == mx.float16
+    assert packed.dtype == mx.uint8 and packed.ndim == 2 and packed.shape[1] == 48
+    assert norms.dtype == mx.float16 and norms.ndim == 2
+    assert codebook.dtype == mx.float16 and codebook.size == 8
+
+    OC = norms.shape[0]
+    n_groups = norms.shape[1]
+    assert OC % 8 == 0, f"v2 kernel requires OC % 8 == 0, got OC={OC}"
+    assert x_rot.size == n_groups * 128
+    assert packed.shape[0] == OC * n_groups
+
+    OC_arg = mx.array([OC], dtype=mx.uint32)
+    ng_arg = mx.array([n_groups], dtype=mx.uint32)
+
+    kernel = _gemv_v2_kernel()
+    # Dispatch: threadgroup has 2 simdgroups (64 threads), each computes 4
+    # output rows. So we need OC/8 threadgroups.
+    threads_per_tg = 64
+    n_tgs_y = OC // 8
+    out = kernel(
+        inputs=[x_rot, packed, norms, codebook, OC_arg, ng_arg],
+        grid=(threads_per_tg, n_tgs_y, 1),
+        threadgroup=(threads_per_tg, 1, 1),
         output_shapes=[(OC,)],
         output_dtypes=[mx.float16],
     )[0]
