@@ -307,8 +307,20 @@ class TurboQuantOnlineLinearMethod:
 
 
 # ── TurboQuantOnlineMoEMethod (module-level so cloudpickle can serialize) ────
+# Inherits from FusedMoEMethodBase to satisfy vLLM's isinstance check in
+# FusedMoE.__init__(). The base class is available in vLLM >= 0.19.0.
 
-class TurboQuantOnlineMoEMethod:
+try:
+    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+        FusedMoEMethodBase,
+    )
+    _HAS_FUSEDMOE_BASE = True
+except ImportError:
+    FusedMoEMethodBase = object  # type: ignore[assignment,misc]
+    _HAS_FUSEDMOE_BASE = False
+
+
+class TurboQuantOnlineMoEMethod(FusedMoEMethodBase if _HAS_FUSEDMOE_BASE else object):
     """Meta-device MoE: compress after loading, decompress per forward.
 
     The MoE kernel is initialized by the underlying unquantized
@@ -324,6 +336,7 @@ class TurboQuantOnlineMoEMethod:
             UnquantizedFusedMoEMethod,
         )
 
+        super().__init__(moe_config)
         self.bits = bits
         self.group_size = group_size
         self._unquant = UnquantizedFusedMoEMethod(moe_config)
